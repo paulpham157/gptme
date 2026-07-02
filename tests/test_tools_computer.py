@@ -14,6 +14,7 @@ from gptme.tools.computer import (
     MODIFIER_KEYS,
     _chunks,
     _get_display_resolution,
+    _get_macos_display_scale,
     _linux_accessibility_tree,
     _linux_click_accessible_element,
     _linux_scroll,
@@ -301,6 +302,130 @@ Graphics/Displays:
         width, height = _get_display_resolution()
         assert width == 2560
         assert height == 1664
+
+
+# === _get_macos_display_scale() tests ===
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_get_macos_display_scale_via_appkit():
+    """Scale factor is read from AppKit.NSScreen.backingScaleFactor() when available."""
+    _get_macos_display_scale.cache_clear()
+    mock_screen = mock.MagicMock()
+    mock_screen.backingScaleFactor.return_value = 2.0
+    mock_appkit = mock.MagicMock()
+    mock_appkit.NSScreen.mainScreen.return_value = mock_screen
+
+    with mock.patch.dict("sys.modules", {"AppKit": mock_appkit}):
+        scale = _get_macos_display_scale()
+
+    assert scale == 2.0
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_get_macos_display_scale_via_system_profiler():
+    """Scale factor is derived from system_profiler when AppKit is unavailable."""
+    _get_macos_display_scale.cache_clear()
+    profiler_output = """\
+Graphics/Displays:
+    Apple M1:
+      Displays:
+        Color LCD:
+          Resolution: 2560 x 1664 Retina
+          UI Looks like: 1280 x 832 @ 60.00Hz
+"""
+
+    with (
+        mock.patch.dict("sys.modules", {"AppKit": None}),
+        mock.patch("subprocess.check_output", return_value=profiler_output),
+    ):
+        scale = _get_macos_display_scale()
+
+    assert scale == pytest.approx(2560 / 1280, rel=1e-3)
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_get_macos_display_scale_via_system_profiler_multi_display():
+    """Scale factor parsed correctly even when system_profiler has 'Maximum Resolution' before 'Resolution:'."""
+    _get_macos_display_scale.cache_clear()
+    profiler_output = """\
+Graphics/Displays:
+
+    Display with External Monitor:
+      Displays:
+        Built-In Retina:
+          Maximum Resolution: 3840 x 2160
+          Resolution: 2560 x 1664 Retina
+          UI Looks like: 1280 x 832 @ 60.00Hz
+        External Monitor:
+          Resolution: 1920 x 1080
+          UI Looks like: 1920 x 1080 @ 60.00Hz
+"""
+
+    with (
+        mock.patch.dict("sys.modules", {"AppKit": None}),
+        mock.patch("subprocess.check_output", return_value=profiler_output),
+    ):
+        scale = _get_macos_display_scale()
+
+    # Must NOT match "Maximum Resolution: 3840 x 2160" — should find actual Resolution: 2560
+    # giving 2560 / 1280 = 2.0
+    assert scale == pytest.approx(2.0, rel=1e-3)
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_get_macos_display_scale_via_system_profiler_prefers_main_display():
+    """Main Display metadata wins when multiple display blocks have valid scale pairs."""
+    _get_macos_display_scale.cache_clear()
+    profiler_output = """\
+Graphics/Displays:
+    Apple M1:
+      Displays:
+        External Monitor:
+          Resolution: 1920 x 1080
+          UI Looks like: 1920 x 1080 @ 60.00Hz
+        Color LCD:
+          Main Display: Yes
+          Resolution: 2560 x 1664 Retina
+          UI Looks like: 1280 x 832 @ 60.00Hz
+"""
+
+    with (
+        mock.patch.dict("sys.modules", {"AppKit": None}),
+        mock.patch("subprocess.check_output", return_value=profiler_output),
+    ):
+        scale = _get_macos_display_scale()
+
+    assert scale == pytest.approx(2.0, rel=1e-3)
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_get_macos_display_scale_fallback_to_2x():
+    """Falls back to 2.0 when both AppKit and system_profiler are unavailable."""
+    _get_macos_display_scale.cache_clear()
+    with (
+        mock.patch.dict("sys.modules", {"AppKit": None}),
+        mock.patch(
+            "subprocess.check_output",
+            side_effect=subprocess.CalledProcessError(1, "system_profiler"),
+        ),
+    ):
+        scale = _get_macos_display_scale()
+
+    assert scale == 2.0
+
+
+@mock.patch("gptme.tools.computer._get_display_resolution", return_value=(2560, 1664))
+@mock.patch("gptme.tools.computer._get_macos_display_scale", return_value=2.0)
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_coordinate_scaling_macos_2x(mock_scale, mock_res):
+    """Coordinate scaling on macOS 2× Retina yields logical (non-physical) coords."""
+    # Physical: 2560×1664, logical (after ÷2): 1280×832
+    # Clicking at API (640, 416) with API space 1280×832 → physical (1280, 832)
+    # But gptme works in logical space, so we expect (640, 416)
+    x, y = _scale_coordinates(_ScalingSource.API, 640, 416, 1280, 832)
+    assert x == 640
+    assert y == 416
 
 
 # === _run_xdotool() tests ===
@@ -835,8 +960,9 @@ _MOCK_MACOS_RES = (1920, 1080)
 @mock.patch(
     "gptme.tools.computer._get_display_resolution", return_value=_MOCK_MACOS_RES
 )
+@mock.patch("gptme.tools.computer._get_macos_display_scale", return_value=2.0)
 @mock.patch("subprocess.run")
-def test_computer_cursor_position_macos(mock_run, mock_res):
+def test_computer_cursor_position_macos(mock_run, mock_scale, mock_res):
     """Test cursor_position on macOS parses cliclick output correctly."""
     from gptme.tools.computer import computer
 
@@ -1125,7 +1251,7 @@ def test_wait_for_change_detects_change(mock_transport, mock_res, tmp_path):
 
     with (
         mock.patch("gptme.tools.computer.screenshot", side_effect=_fake_screenshot),
-        mock.patch("gptme.tools.computer.time.sleep"),
+        mock.patch("gptme.tools.computer._sleep"),
         mock.patch(
             "gptme.tools.computer._make_screenshot_msg", return_value=mock.sentinel.msg
         ),
@@ -1157,9 +1283,9 @@ def test_wait_for_change_timeout_returns_screenshot(mock_transport, mock_res, tm
 
     with (
         mock.patch("gptme.tools.computer.screenshot", return_value=static),
-        mock.patch("gptme.tools.computer.time.sleep"),
+        mock.patch("gptme.tools.computer._sleep"),
         mock.patch(
-            "gptme.tools.computer.time.monotonic", side_effect=monotonic_side_effect
+            "gptme.tools.computer._monotonic", side_effect=monotonic_side_effect
         ),
         mock.patch(
             "gptme.tools.computer._make_screenshot_msg",
@@ -1195,8 +1321,8 @@ def test_wait_for_change_polls_with_backoff(mock_transport, mock_res, tmp_path):
 
     with (
         mock.patch("gptme.tools.computer.screenshot", return_value=static),
-        mock.patch("gptme.tools.computer.time.sleep", side_effect=_record_sleep),
-        mock.patch("gptme.tools.computer.time.monotonic", side_effect=_fake_monotonic),
+        mock.patch("gptme.tools.computer._sleep", side_effect=_record_sleep),
+        mock.patch("gptme.tools.computer._monotonic", side_effect=_fake_monotonic),
         mock.patch(
             "gptme.tools.computer._make_screenshot_msg",
             return_value=mock.sentinel.timeout_msg,
@@ -1336,8 +1462,8 @@ def test_macos_window_focus_no_match_raises():
     """
     with (
         mock.patch("gptme.tools.computer.subprocess.run") as mock_run,
-        mock.patch("gptme.tools.computer.time.monotonic") as mock_time,
-        mock.patch("gptme.tools.computer.time.sleep"),
+        mock.patch("gptme.tools.computer._monotonic") as mock_time,
+        mock.patch("gptme.tools.computer._sleep"),
         pytest.raises(RuntimeError, match="No window matching.*'MissingApp'"),
     ):
         # First call returns not_found, second call has monotonic past deadline
@@ -1357,10 +1483,8 @@ def test_macos_window_focus_retry_then_found():
     ]
     with (
         mock.patch("gptme.tools.computer.subprocess.run", side_effect=results),
-        mock.patch(
-            "gptme.tools.computer.time.monotonic", side_effect=[0.0, 0.5, 1.0, 1.5]
-        ),
-        mock.patch("gptme.tools.computer.time.sleep"),
+        mock.patch("gptme.tools.computer._monotonic", side_effect=[0.0, 0.5, 1.0, 1.5]),
+        mock.patch("gptme.tools.computer._sleep"),
     ):
         _macos_window_focus("SlowApp", timeout=10.0)
 

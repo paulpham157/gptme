@@ -85,6 +85,7 @@ Using a single sequence for complex operations ensures proper timing and recogni
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import os
 import platform
@@ -107,6 +108,10 @@ if TYPE_CHECKING:
     from .computer_transport import ComputerTransport
 
 logger = logging.getLogger(__name__)
+
+# Patch these aliases in tests instead of mutating the process-wide time module.
+_monotonic = time.monotonic
+_sleep = time.sleep
 
 
 # Platform detection
@@ -255,6 +260,88 @@ def _get_display_resolution() -> tuple[int, int]:
     raise RuntimeError("Failed to get display resolution")
 
 
+@functools.lru_cache(maxsize=1)
+def _get_macos_display_scale() -> float:
+    """Detect the macOS HiDPI/Retina backing scale factor.
+
+    Tries in order:
+    1. ``AppKit.NSScreen.mainScreen().backingScaleFactor()`` — accurate for any display config
+    2. Ratio of physical "Resolution:" to logical "UI Looks like" in ``system_profiler``
+    3. Falls back to ``2.0`` (standard Retina)
+    """
+    # Method 1: AppKit (preferred — works for all display configs including external monitors)
+    try:
+        import AppKit  # type: ignore[import-not-found,import-untyped]
+
+        screen = AppKit.NSScreen.mainScreen()
+        if screen is not None:
+            return float(screen.backingScaleFactor())
+    except Exception:
+        pass
+
+    # Method 2: Parse system_profiler output for "UI Looks like: NNN x NNN"
+    try:
+        output = subprocess.check_output(
+            ["system_profiler", "SPDisplaysDataType"], text=True, timeout=10
+        )
+        current_physical_w: int | None = None
+        current_logical_w: int | None = None
+        current_is_main = False
+        fallback_scale: float | None = None
+
+        def record_candidate() -> float | None:
+            nonlocal fallback_scale
+            if (
+                current_physical_w is None
+                or current_logical_w is None
+                or current_logical_w <= 0
+            ):
+                return None
+
+            scale = current_physical_w / current_logical_w
+            if current_is_main:
+                return scale
+            if fallback_scale is None or (fallback_scale == 1.0 and scale != 1.0):
+                fallback_scale = scale
+            return None
+
+        for line in output.splitlines():
+            stripped = line.strip()
+            if (
+                line.startswith("        ")
+                and not line.startswith("          ")
+                and stripped.endswith(":")
+            ):
+                scale = record_candidate()
+                if scale is not None:
+                    return scale
+                current_physical_w = None
+                current_logical_w = None
+                current_is_main = False
+                continue
+
+            if stripped.startswith("Resolution:"):
+                parts = stripped.split(":")[-1].split("x")
+                current_physical_w = int(parts[0].strip())
+            elif stripped.startswith("UI Looks like:"):
+                # "UI Looks like: 1280 x 832 @ 60.00Hz"
+                parts = stripped.split(":")[-1].split("x")
+                current_logical_w = int(parts[0].strip())
+            elif stripped == "Main Display: Yes":
+                current_is_main = True
+
+        scale = record_candidate()
+        if scale is not None:
+            return scale
+        if fallback_scale is not None:
+            return fallback_scale
+    except Exception:
+        pass
+
+    # Method 3: Assume standard 2× Retina
+    return 2.0
+
+
 def _scale_coordinates(
     source: _ScalingSource, x: int, y: int, api_width: int, api_height: int
 ) -> tuple[int, int]:
@@ -264,11 +351,7 @@ def _scale_coordinates(
 
     # Account for macOS display scaling factor
     if IS_MACOS:
-        # macOS display scaling factor
-        # TODO: retrieve somehow? we could move mouse to the bottom right and then get the position
-        # (but it's hacky and confusing to users)
-        display_scale = 2560 / 1709
-
+        display_scale = _get_macos_display_scale()
         physical_width = int(physical_width / display_scale)
         physical_height = int(physical_height / display_scale)
         logger.info(
@@ -1038,7 +1121,7 @@ def _macos_window_focus(pattern: str, timeout: float = 10.0) -> None:
         "  end tell\n"
         "end run"
     )
-    deadline = time.monotonic() + timeout
+    deadline = _monotonic() + timeout
     while True:
         try:
             result = subprocess.run(
@@ -1057,11 +1140,11 @@ def _macos_window_focus(pattern: str, timeout: float = 10.0) -> None:
 
         if result.stdout.strip() == "found":
             return
-        if time.monotonic() >= deadline:
+        if _monotonic() >= deadline:
             raise RuntimeError(
                 f"No window matching {pattern!r} appeared within {timeout:.0f}s"
             )
-        time.sleep(0.5)
+        _sleep(0.5)
 
 
 def _macos_click(button: int) -> None:
@@ -1215,9 +1298,9 @@ def _dispatch_transport(
         max_poll_interval = 0.5
         change_threshold = 0.01
         baseline = transport.screenshot()
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            time.sleep(poll_interval)
+        deadline = _monotonic() + timeout
+        while _monotonic() < deadline:
+            _sleep(poll_interval)
             current = transport.screenshot()
             ratio = _compute_change_ratio(baseline, current)
             if ratio >= change_threshold:
@@ -1502,9 +1585,9 @@ def computer(
         max_poll_interval = 0.5
         change_threshold = 0.01  # 1% of pixels must differ
         baseline = screenshot()
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            time.sleep(poll_interval)
+        deadline = _monotonic() + timeout
+        while _monotonic() < deadline:
+            _sleep(poll_interval)
             current = screenshot()
             ratio = _compute_change_ratio(baseline, current)
             if ratio >= change_threshold:
