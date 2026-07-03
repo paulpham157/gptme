@@ -8,6 +8,7 @@ import select
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -304,8 +305,11 @@ The interface provides /commands during a conversation:
 {commands_help}
 
 \b
-Built-in shortcuts:
+Subcommand shortcuts:
   gptme search QUERY      Search conversation logs (alias for gptme-util chats search)
+  gptme chats [args]      Any gptme-util subcommand works directly (chats, tools, skills, ...)
+  gptme sessions          Delegates to gptme-sessions if installed (gptme-* in PATH)
+  gptme <cmd> [args]      gptme-util subcommand or gptme-<cmd> binary, in that order
 
 \b
 Utilities (gptme-util):
@@ -572,6 +576,29 @@ def main(
             query, max_results=20, context_lines=1, max_matches=1
         )  # show more results than the default 5
         return
+
+    # gptme-util subcommand mirroring: `gptme chats [...]` → `gptme-util chats [...]`
+    # Any top-level gptme-util subcommand can be invoked without typing 'gptme-util'.
+    if prompts and not version and not version_json:
+        from .util import UTIL_SUBCOMMANDS  # cheap: just a sorted list constant
+
+        if prompts[0] in UTIL_SUBCOMMANDS:
+            if util_exec := shutil.which("gptme-util"):
+                sys.exit(subprocess.call([util_exec, *prompts]))
+            else:
+                print(
+                    f"Error: '{prompts[0]}' is a gptme-util subcommand but gptme-util is not installed.\n"
+                    "Install it with: pip install gptme[util]",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+    # Plugin dispatch: `gptme CMD [args...]` → `gptme-CMD [args...]` if installed
+    # Enables extensibility: `gptme sessions` works if gptme-sessions is in PATH.
+    if prompts and not version and not version_json:
+        plugin = f"gptme-{prompts[0]}"
+        if plugin_path := shutil.which(plugin):
+            sys.exit(subprocess.call([plugin_path, *prompts[1:]]))
 
     # Defense-in-depth: handle empty/whitespace names in case Click bypasses convert()
     # (observed to occur in some Click versions when --name "" is passed)
