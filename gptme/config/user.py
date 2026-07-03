@@ -395,6 +395,59 @@ def set_config_value(
         reload_config()
 
 
+def save_provider_config(
+    provider: "ProviderConfig", reload: bool = True, local: bool = False
+) -> None:
+    """Append a [[providers]] entry to the user config file.
+
+    Args:
+        provider: ProviderConfig to save.
+        reload: Whether to reload the in-memory config after writing.
+        local: If True, write to config.local.toml instead of config.toml.
+               Use for entries with inline api_key (secrets).
+    """
+    if local:
+        _, local_path = get_user_config_paths()
+        write_path = str(local_path)
+        doc: TOMLDocument | Container = (
+            _load_config_doc(write_path) if local_path.exists() else tomlkit.document()
+        )
+    else:
+        write_path = config_path
+        doc = _load_config_doc()
+
+    provider_table = tomlkit.table()
+    provider_table.add("name", provider.name)
+    provider_table.add("base_url", provider.base_url)
+    if provider.api_key:
+        provider_table.add("api_key", provider.api_key)
+    if provider.api_key_env:
+        provider_table.add("api_key_env", provider.api_key_env)
+    if provider.default_model:
+        provider_table.add("default_model", provider.default_model)
+
+    if "providers" not in doc:
+        doc.add("providers", tomlkit.aot())  # type: ignore[attr-defined]
+
+    providers = doc["providers"]
+    for idx, existing_provider in enumerate(providers):  # type: ignore[union-attr]
+        if existing_provider.get("name") == provider.name:
+            providers[idx] = provider_table
+            break
+    else:
+        providers.append(provider_table)
+
+    if local:
+        os.makedirs(os.path.dirname(write_path), exist_ok=True)
+    with open(write_path, "w") as config_file:
+        tomlkit.dump(doc, config_file)
+
+    if reload:
+        from .core import reload_config
+
+        reload_config()
+
+
 def _merge_config_data(main_config: dict, local_config: dict) -> dict:
     """
     Merge local configuration into main configuration.
@@ -442,6 +495,26 @@ def _merge_config_data(main_config: dict, local_config: dict) -> dict:
                 if mcp_key != "servers":
                     merged["mcp"][mcp_key] = mcp_value
 
+        elif key == "providers" and isinstance(value, list):
+            # Merge providers by name - local provider entries update matching
+            # main providers (e.g. adding api_key to an otherwise-identical entry),
+            # and new providers are appended.
+            if key not in merged:
+                merged[key] = []
+            main_providers = merged[key]
+            main_by_name: dict = {}
+            for p in main_providers:
+                if isinstance(p, dict) and "name" in p:
+                    main_by_name[p["name"]] = p
+            for local_provider in value:
+                if not isinstance(local_provider, dict):
+                    main_providers.append(local_provider)
+                    continue
+                name = local_provider.get("name")
+                if name and name in main_by_name:
+                    main_by_name[name].update(local_provider)
+                else:
+                    main_providers.append(local_provider)
         elif (
             isinstance(value, dict) and key in merged and isinstance(merged[key], dict)
         ):
