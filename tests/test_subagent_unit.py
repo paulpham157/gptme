@@ -2459,47 +2459,97 @@ class TestMaxTimeWatchdog:
         )
 
         barrier = threading.Barrier(2)
+        stop = threading.Event()
 
         def slow_fn():
             barrier.wait()  # Signal we're running
-            import time
-
-            time.sleep(60)  # Would run forever without a cancel
+            stop.wait(60)  # Would run forever without a cancel
 
         t = threading.Thread(target=slow_fn, daemon=True)
         t.start()
         barrier.wait()  # Ensure thread is alive before proceeding
 
-        sa = Subagent(
-            agent_id="running-thread",
-            prompt="test",
-            thread=t,
-            logdir=tmp_path,
-            model=None,
-            execution_mode="thread",
+        try:
+            sa = Subagent(
+                agent_id="running-thread",
+                prompt="test",
+                thread=t,
+                logdir=tmp_path,
+                model=None,
+                execution_mode="thread",
+            )
+            with _subagents_lock:
+                _subagents.append(sa)
+
+            _timeout_subagent("running-thread", 0.5)
+
+            with _subagent_results_lock:
+                result = _subagent_results.get("running-thread")
+
+            assert result is not None
+            assert result.status == "timeout"
+            assert "0.5s" in (result.result or "")
+
+            # Completion notification should be queued
+            notifications = []
+            while not _completion_queue.empty():
+                try:
+                    notifications.append(_completion_queue.get_nowait())
+                except queue.Empty:
+                    break
+            assert any(
+                n[0] == "running-thread" and n[1] == "timeout" for n in notifications
+            )
+        finally:
+            stop.set()
+            t.join(timeout=1)
+
+    def test_subagent_wait_returns_cached_timeout_while_thread_is_still_alive(
+        self, tmp_path
+    ):
+        """subagent_wait() must surface a watchdog timeout even before the thread exits."""
+        from gptme.tools.subagent.api import subagent_wait
+        from gptme.tools.subagent.types import (
+            _subagent_results,
+            _subagent_results_lock,
+            _subagents,
+            _subagents_lock,
         )
-        with _subagents_lock:
-            _subagents.append(sa)
 
-        _timeout_subagent("running-thread", 0.5)
+        barrier = threading.Barrier(2)
+        stop = threading.Event()
 
-        with _subagent_results_lock:
-            result = _subagent_results.get("running-thread")
+        def slow_fn():
+            barrier.wait()
+            stop.wait(60)
 
-        assert result is not None
-        assert result.status == "timeout"
-        assert "0.5s" in (result.result or "")
+        t = threading.Thread(target=slow_fn, daemon=True)
+        t.start()
+        barrier.wait()
 
-        # Completion notification should be queued
-        notifications = []
-        while not _completion_queue.empty():
-            try:
-                notifications.append(_completion_queue.get_nowait())
-            except queue.Empty:
-                break
-        assert any(
-            n[0] == "running-thread" and n[1] == "timeout" for n in notifications
-        )
+        try:
+            sa = Subagent(
+                agent_id="wait-timeout-thread",
+                prompt="test",
+                thread=t,
+                logdir=tmp_path,
+                model=None,
+                execution_mode="thread",
+            )
+            with _subagents_lock:
+                _subagents.append(sa)
+            with _subagent_results_lock:
+                _subagent_results["wait-timeout-thread"] = ReturnType(
+                    "timeout", "Auto-cancelled after 0.5s (max_time exceeded)"
+                )
+
+            result = subagent_wait("wait-timeout-thread", timeout=0)
+
+            assert result["status"] == "timeout"
+            assert "max_time exceeded" in (result["result"] or "")
+        finally:
+            stop.set()
+            t.join(timeout=1)
 
     def test_completion_hook_timeout_message(self):
         """_subagent_completion_hook yields a ⏱️ message for timeout status."""
@@ -2536,13 +2586,23 @@ class TestMaxTimeWatchdog:
         monkeypatch.setattr(exec_mod, "_cleanup_isolation", lambda sa: None)
 
         timers_started: list[float] = []
-        original_timer = threading.Timer
 
-        class CapturingTimer(original_timer):  # type: ignore[misc,valid-type]
+        class CapturingTimer:
+            """Non-starting mock — records creation args without launching a real thread."""
+
             def __init__(self, interval, function, args=None, kwargs=None):
-                super().__init__(interval, function, args=args, kwargs=kwargs)
-                timers_started.append(interval)
+                self.interval = interval
+                self.function = function
+                self.args = args or ()
+                self.kwargs = kwargs or {}
                 self.daemon = True
+                timers_started.append(interval)
+
+            def start(self):
+                pass  # Don't start a real thread — test only verifies Timer was called
+
+            def cancel(self):
+                pass
 
         monkeypatch.setattr(threading, "Timer", CapturingTimer)
 
@@ -2577,13 +2637,23 @@ class TestMaxTimeWatchdog:
         monkeypatch.setattr(exec_mod, "_cleanup_isolation", lambda sa: None)
 
         timers_started: list[float] = []
-        original_timer = threading.Timer
 
-        class CapturingTimer(original_timer):  # type: ignore[misc,valid-type]
+        class CapturingTimer:
+            """Non-starting mock — records creation args without launching a real thread."""
+
             def __init__(self, interval, function, args=None, kwargs=None):
-                super().__init__(interval, function, args=args, kwargs=kwargs)
-                timers_started.append(interval)
+                self.interval = interval
+                self.function = function
+                self.args = args or ()
+                self.kwargs = kwargs or {}
                 self.daemon = True
+                timers_started.append(interval)
+
+            def start(self):
+                pass  # Don't start a real thread — test only verifies Timer was called
+
+            def cancel(self):
+                pass
 
         monkeypatch.setattr(threading, "Timer", CapturingTimer)
 
