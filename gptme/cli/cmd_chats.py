@@ -12,7 +12,12 @@ from ..logmanager import LogManager
 from ..logmanager.conversations import ConversationMeta
 from ..prompt_queue import queue_prompt
 from ..tools import get_tools, init_tools
-from ..tools.chats import find_empty_conversations, list_chats, search_chats
+from ..tools.chats import (
+    find_empty_conversations,
+    list_chats,
+    search_chats,
+    search_external_chats,
+)
 from ..util.conversation_ids import is_valid_conversation_id
 
 
@@ -126,6 +131,11 @@ def chats_list(limit: int, summarize: bool, output_json: bool, metadata: bool):
 @click.option(
     "-m", "--matches", default=1, help="Maximum matches to show per conversation."
 )
+@click.option(
+    "--all-agents",
+    is_flag=True,
+    help="Also search Cursor and Codex CLI sessions (reads ~/.cursor/ and ~/.codex/).",
+)
 def chats_search(
     query: str,
     limit: int,
@@ -133,6 +143,7 @@ def chats_search(
     output_json: bool,
     context: int,
     matches: int,
+    all_agents: bool,
 ):
     """Search conversation logs."""
     if not query.strip():
@@ -140,6 +151,12 @@ def chats_search(
     _ensure_tools()
 
     if output_json:
+        if all_agents:
+            click.echo(
+                "Warning: --all-agents is not supported with --json; "
+                "only gptme native sessions will be included.",
+                err=True,
+            )
         from ..logmanager import LogManager, list_conversations  # fmt: skip
         from ..tools.chats import _get_matching_messages  # fmt: skip
 
@@ -177,6 +194,8 @@ def chats_search(
             tool_format="markdown",
         )
     search_chats(query, max_results=limit, context_lines=context, max_matches=matches)
+    if all_agents:
+        search_external_chats(query, max_results=limit)
 
 
 @chats.command("read")

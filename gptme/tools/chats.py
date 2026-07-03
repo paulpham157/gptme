@@ -146,6 +146,222 @@ def search_chats(
             print(f"     {match_str}")
 
 
+# ---------------------------------------------------------------------------
+# External agent session search (Cursor, Codex)
+# ---------------------------------------------------------------------------
+
+
+def _discover_cursor_sessions(cursor_dir: Path | None = None) -> list[Path]:
+    """Return paths to Cursor conversation files under *cursor_dir*.
+
+    Looks for:
+
+    - ``<cursor_dir>/<uuid>/conversation.json`` (standard per-session format)
+    - ``<cursor_dir>/../cursor-chat-history.json`` (alternate workspace-storage
+      format with ``allConversations`` array)
+
+    Pass *cursor_dir* explicitly in tests.
+    """
+    if cursor_dir is None:
+        cursor_dir = Path.home() / ".cursor" / "conversations"
+    if not cursor_dir.exists():
+        return []
+    results: list[Path] = sorted(cursor_dir.glob("*/conversation.json"))
+    # cursor-chat-history.json lives at the .cursor/ root, not under conversations/
+    alt = cursor_dir.parent / "cursor-chat-history.json"
+    if alt.exists():
+        results.append(alt)
+    return results
+
+
+def _search_cursor_session(path: Path, query: str) -> list[dict]:
+    """Search a single Cursor ``conversation.json`` for *query*.
+
+    Handles both the standard format (``messages`` list) and the alternate
+    workspace-storage format (``allConversations`` / ``bubbles``).
+    Returns a list of hit dicts with keys ``role``, ``content``,
+    ``session_title``.
+    """
+    try:
+        data = json_mod.loads(path.read_text(encoding="utf-8"))
+    except (json_mod.JSONDecodeError, OSError):
+        return []
+
+    query_lower = query.lower()
+    results: list[dict] = []
+
+    # Standard format: {"title": "...", "messages": [{"role": ..., "content": ...}]}
+    for msg in data.get("messages", []):
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            continue
+        if query_lower in content.lower():
+            results.append(
+                {
+                    "role": role,
+                    "content": content[:500],
+                    "session_title": data.get("title", path.parent.name),
+                }
+            )
+
+    # Alternate format (cursor-chat-history.json):
+    # {"allConversations": [{"composerId": "...", "bubbles": [...]}]}
+    if not results:
+        for conv in data.get("allConversations", []):
+            for bubble in conv.get("bubbles", []):
+                btype = bubble.get("type", "")
+                if btype == "user":
+                    content = bubble.get("text", "")
+                    role = "user"
+                elif btype == "ai":
+                    raw = bubble.get("rawResponse", {})
+                    content = raw.get("text", "") if isinstance(raw, dict) else ""
+                    role = "assistant"
+                else:
+                    continue
+                if not isinstance(content, str):
+                    continue
+                if query_lower in content.lower():
+                    results.append(
+                        {
+                            "role": role,
+                            "content": content[:500],
+                            "session_title": conv.get("composerId", path.parent.name),
+                        }
+                    )
+
+    return results
+
+
+def _discover_codex_sessions(codex_dir: Path | None = None) -> list[Path]:
+    """Return paths to Codex CLI session files under *codex_dir*.
+
+    Real Codex CLI sessions are date-partitioned as
+    ``<codex_dir>/YYYY/MM/DD/rollout-*.jsonl``, so this searches recursively.
+    Pass *codex_dir* explicitly in tests.
+    """
+    if codex_dir is None:
+        codex_dir = Path.home() / ".codex" / "sessions"
+    if not codex_dir.exists():
+        return []
+    return sorted(codex_dir.rglob("rollout-*.jsonl"))
+
+
+def _search_codex_session(path: Path, query: str) -> list[dict]:
+    """Search a Codex CLI ``.jsonl`` session file for *query*.
+
+    Each line is a JSON record. Only ``{"type": "response_item", "payload":
+    {"type": "message", ...}}`` records are searched; other record types
+    (``session_meta``, ``event_msg``, ``turn_context``, tool calls, etc.) are
+    skipped. Message content is a list of content-part dicts (``input_text``
+    / ``output_text``) whose ``text`` fields are joined before matching.
+    Returns a list of hit dicts with keys ``role``, ``content``,
+    ``session_title``.
+    """
+    query_lower = query.lower()
+    results: list[dict] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json_mod.loads(line)
+            except json_mod.JSONDecodeError:
+                continue
+            if record.get("type") != "response_item":
+                continue
+            payload = record.get("payload", {})
+            if not isinstance(payload, dict) or payload.get("type") != "message":
+                continue
+            role = payload.get("role", "unknown")
+            parts = payload.get("content", [])
+            if not isinstance(parts, list):
+                continue
+            content = "".join(
+                part.get("text", "") for part in parts if isinstance(part, dict)
+            )
+            if query_lower in content.lower():
+                results.append(
+                    {
+                        "role": role,
+                        "content": content[:500],
+                        "session_title": path.stem,
+                    }
+                )
+    except OSError:
+        pass
+    return results
+
+
+def search_external_chats(
+    query: str,
+    max_results: int = 5,
+    include_cursor: bool = True,
+    include_codex: bool = True,
+    cursor_dir: Path | None = None,
+    codex_dir: Path | None = None,
+) -> None:
+    """Search external agent sessions (Cursor, Codex) for *query*.
+
+    Prints matching snippets grouped by source agent, with a ``[Cursor]``
+    or ``[Codex]`` label so results are clearly distinguished from gptme
+    native results.
+
+    Args:
+        query: The search query (case-insensitive substring match).
+        max_results: Maximum number of sessions to display.
+        include_cursor: Whether to search Cursor sessions.
+        include_codex: Whether to search Codex sessions.
+        cursor_dir: Override the default Cursor conversations directory.
+        codex_dir: Override the default Codex sessions directory.
+    """
+    if not query.strip():
+        print("Error: search query cannot be empty.", file=sys.stderr)
+        return
+
+    all_results: list[dict] = []
+
+    if include_cursor:
+        for session_path in _discover_cursor_sessions(cursor_dir):
+            if len(all_results) >= max_results:
+                break
+            matches = _search_cursor_session(session_path, query)
+            if matches:
+                all_results.append(
+                    {"agent": "Cursor", "path": session_path, "matches": matches}
+                )
+
+    if include_codex:
+        for session_path in _discover_codex_sessions(codex_dir):
+            if len(all_results) >= max_results:
+                break
+            matches = _search_codex_session(session_path, query)
+            if matches:
+                all_results.append(
+                    {"agent": "Codex", "path": session_path, "matches": matches}
+                )
+
+    if not all_results:
+        return
+
+    total_matches = sum(len(r["matches"]) for r in all_results)
+    shown = all_results[:max_results]
+    print(
+        f"\nExternal agent results for '{query}' "
+        f"({len(all_results)} sessions, {total_matches} matches):"
+    )
+    for i, result in enumerate(shown, 1):
+        agent = result["agent"]
+        matches = result["matches"]
+        title = matches[0]["session_title"] if matches else result["path"].stem
+        print(f"\n{i}. [{agent}] {title} ({len(matches)} match(es)):")
+        for match in matches[:1]:
+            snippet = match["content"][:200].replace("\n", " ")
+            print(f"   ({match['role']}): {snippet}…")
+
+
 def _format_message_with_context(
     content: str | object, query: str, context_lines: int = 1, max_matches: int = 1
 ) -> str:
