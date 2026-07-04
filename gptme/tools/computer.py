@@ -97,9 +97,12 @@ import platform
 import shlex
 import shutil
 import subprocess
+import tempfile
+import threading
 import time
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, TypedDict
+from pathlib import Path
+from typing import IO, TYPE_CHECKING, Literal, TypedDict
 
 from ._computer_gate import action_risk_level, sensitive_action_gate
 from .base import ToolFunction, ToolSpec, ToolUse
@@ -108,8 +111,6 @@ from .screenshot import screenshot
 from .vision import view_image
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from ..message import ArtifactDescriptor, Message, MessageMetadata
     from .computer_transport import ComputerTransport
 
@@ -122,6 +123,17 @@ _sleep = time.sleep
 
 # Platform detection
 IS_MACOS = platform.system() == "Darwin"
+
+
+def _read_ffmpeg_stderr(stderr: IO[bytes] | None) -> str:
+    if stderr is None:
+        return ""
+    try:
+        stderr.seek(0)
+        text = stderr.read().decode(errors="replace").strip()
+    except OSError:
+        return ""
+    return text[-4000:]
 
 
 def _stream_action_risk(
@@ -2175,6 +2187,235 @@ def observe_desktop() -> Message | None:
     return computer("screenshot")
 
 
+class ScreenRecording:
+    """Handle for an in-progress screen recording.
+
+    Returned by ``start_recording()``.  Call ``.stop()`` to finish the
+    recording and get the output path.  Also usable as a context manager::
+
+        with start_recording("session.mp4") as rec:
+            # ... do things on screen ...
+            pass  # recording stops here
+        print(rec.output_path)  # path to the MP4
+
+    Attributes:
+        output_path: Destination file path (set at construction time).
+    """
+
+    def __init__(
+        self,
+        process: subprocess.Popen,
+        output_path: Path,
+        stderr: IO[bytes] | None = None,
+    ) -> None:
+        self._process = process
+        self._stderr = stderr
+        self.output_path = output_path
+        self._stop_lock = threading.Lock()
+        self._stop_error: str | None = None
+        self._stopped = threading.Event()
+
+    def stop(self) -> Path:
+        """Stop the recording.  Safe to call more than once.
+
+        Returns:
+            Path to the completed video file.
+        """
+        if self._stopped.is_set():
+            if self._stop_error is not None:
+                raise RuntimeError(self._stop_error)
+            return self.output_path
+
+        with self._stop_lock:
+            if self._stopped.is_set():
+                if self._stop_error is not None:
+                    raise RuntimeError(self._stop_error)
+                return self.output_path
+            returncode = self._process.poll()
+            if returncode is not None:
+                diagnostic = _read_ffmpeg_stderr(self._stderr)
+                if self._stderr is not None:
+                    self._stderr.close()
+                if returncode != 0:
+                    message = (
+                        "ffmpeg exited before recording was stopped "
+                        f"(return code {returncode})"
+                    )
+                    if diagnostic:
+                        message += f":\n{diagnostic}"
+                    self._stop_error = message
+                    self._stopped.set()
+                    raise RuntimeError(message)
+                self._stopped.set()
+                return self.output_path
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait()
+            if self._stderr is not None:
+                self._stderr.close()
+            self._stopped.set()
+        return self.output_path
+
+    def __enter__(self) -> ScreenRecording:
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.stop()
+
+
+def _ffmpeg_record_cmd(
+    output: Path,
+    fps: int,
+    duration: float | None,
+    display: str,
+    width: int,
+    height: int,
+) -> list[str]:
+    """Build the ffmpeg command for screen recording (platform-aware)."""
+    cmd: list[str] = ["ffmpeg", "-y"]  # -y: overwrite without prompting
+    if IS_MACOS:
+        # avfoundation: "1" = main display (index 1 = first screen).
+        # Users can run `ffmpeg -f avfoundation -list_devices true -i ""` to find the index.
+        cmd += ["-f", "avfoundation", "-r", str(fps), "-capture_cursor", "1", "-i", "1"]
+    else:
+        # x11grab: grab directly from the X11 display buffer.
+        cmd += [
+            "-f",
+            "x11grab",
+            "-r",
+            str(fps),
+            "-s",
+            f"{width}x{height}",
+            "-i",
+            f"{display}",
+        ]
+    if duration is not None:
+        cmd += ["-t", str(duration)]
+    # H.264 with fast-start for streaming / review in browser.
+    cmd += ["-vcodec", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    cmd.append(str(output))
+    return cmd
+
+
+def start_recording(
+    output: str | Path | None = None,
+    fps: int = 10,
+    display: str | None = None,
+) -> ScreenRecording:
+    """Start recording the screen to an MP4 file.
+
+    Uses ``ffmpeg`` with ``x11grab`` (Linux) or ``avfoundation`` (macOS).
+    Returns a ``ScreenRecording`` handle — call ``.stop()`` to finish or
+    use it as a context manager.
+
+    Args:
+        output: Destination path for the MP4 file.  Defaults to a timestamped
+            file in the system temp directory.
+        fps: Frames per second (default 10 — suitable for UI demos; increase
+            to 24+ for smooth game recordings).
+        display: X11 display string (Linux only).  Defaults to ``$DISPLAY``.
+
+    Returns:
+        ``ScreenRecording`` handle.  Call ``.stop()`` when done.
+
+    Raises:
+        RuntimeError: If ``ffmpeg`` is not found or recording fails to start.
+
+    Example (from IPython in a computer-use session)::
+
+        rec = start_recording("tweet-demo.mp4")
+        # ... interact with the browser ...
+        rec.stop()  # saves tweet-demo.mp4
+
+        # Or as a context manager:
+        with start_recording("demo.mp4") as rec:
+            computer_task("open Firefox and navigate to https://example.com")
+        print(rec.output_path)
+    """
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError(
+            "ffmpeg not found — install it first:\n"
+            "  sudo apt install ffmpeg   # Debian/Ubuntu\n"
+            "  brew install ffmpeg       # macOS"
+        )
+
+    if output is None:
+        import tempfile as _tempfile
+
+        fd, tmp = _tempfile.mkstemp(suffix=".mp4", prefix="gptme-screen-")
+        os.close(fd)
+        output_path = Path(tmp)
+    else:
+        output_path = Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    disp: str = display if display is not None else os.environ.get("DISPLAY", ":1")
+    width, height = _get_display_resolution()
+    cmd = _ffmpeg_record_cmd(output_path, fps, None, disp, width, height)
+
+    stderr_log = tempfile.TemporaryFile()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_log,
+        )
+    except Exception:
+        stderr_log.close()
+        raise
+    # Give ffmpeg a moment to start; if it exits immediately it failed.
+    _sleep(0.3)
+    if proc.poll() is not None:
+        diagnostic = _read_ffmpeg_stderr(stderr_log)
+        stderr_log.close()
+        message = (
+            f"ffmpeg exited immediately (return code {proc.returncode}).  "
+            "Check that DISPLAY is set and ffmpeg is installed."
+        )
+        if diagnostic:
+            message += f"\n\nffmpeg stderr:\n{diagnostic}"
+        raise RuntimeError(message)
+    return ScreenRecording(proc, output_path, stderr_log)
+
+
+def record_screen(
+    output: str | Path | None = None,
+    duration: float = 10.0,
+    fps: int = 10,
+    display: str | None = None,
+) -> Path:
+    """Record the screen for a fixed duration and return the output path.
+
+    Synchronous wrapper around ``start_recording()`` / ``ScreenRecording.stop()``.
+    Blocks for *duration* seconds.
+
+    Args:
+        output: Destination path for the MP4 file.  Defaults to a timestamped
+            file in the system temp directory.
+        duration: How many seconds to record (default 10).
+        fps: Frames per second (default 10).
+        display: X11 display string (Linux only).  Defaults to ``$DISPLAY``.
+
+    Returns:
+        :class:`~pathlib.Path` to the finished MP4 file.
+
+    Raises:
+        RuntimeError: If ``ffmpeg`` is not found or recording fails to start.
+
+    Example (from IPython in a computer-use session)::
+
+        path = record_screen("tweet-demo.mp4", duration=30)
+        print(f"Recording saved to {path}")
+    """
+    with start_recording(output=output, fps=fps, display=display) as rec:
+        _sleep(duration)
+        return rec.output_path
+
+
 # Actions that only read state — no post-action screenshot is useful for these.
 _OBSERVATION_ACTIONS: frozenset[str] = frozenset(
     {"screenshot", "cursor_position", "accessibility_tree", "wait_for_change"}
@@ -2491,6 +2732,8 @@ tool = ToolSpec(
         ToolFunction.from_callable(observe_desktop),
         ToolFunction.from_callable(act_and_observe),
         ToolFunction.from_callable(computer_task),
+        ToolFunction.from_callable(record_screen),
+        ToolFunction.from_callable(start_recording),
     ],
     disabled_by_default=True,
 )
