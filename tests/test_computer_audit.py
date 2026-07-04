@@ -953,3 +953,105 @@ def test_audit_log_cli_jsonl_risk_levels_present(tmp_path, monkeypatch):
     assert len(lines) == 3
     risks = [json.loads(line)["risk_level"] for line in lines]
     assert risks == ["read", "write", "sensitive"]
+
+
+# ---------------------------------------------------------------------------
+# --agent-id option: resolve computer_task() agent IDs to subagent conversations
+# ---------------------------------------------------------------------------
+
+
+def test_audit_log_agent_id_resolves_subagent_prefix(tmp_path, monkeypatch):
+    """--agent-id computer-task-abc123 looks up suffixed subagent logs."""
+    agent_id = "computer-task-abc12345"
+    # Thread-mode subagent conversations add a random suffix to the logdir.
+    conv_dir = tmp_path / f"subagent-{agent_id}-r3k9"
+    jsonl = conv_dir / "conversation.jsonl"
+    msgs = [
+        _msg("user", "take a screenshot"),
+        _msg("assistant", _ipython_block("computer('screenshot')")),
+    ]
+    _write_conv_jsonl(jsonl, msgs)
+    monkeypatch.setattr("gptme.cli.cmd_computer.get_logs_dir", lambda: tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        audit_log, ["--agent-id", agent_id, "--json"], catch_exceptions=False
+    )
+    assert result.exit_code == 0, result.output
+    records = json.loads(result.output)
+    assert len(records) == 1
+    assert records[0]["action"] == "screenshot"
+
+
+def test_audit_log_agent_id_rejects_multiple_matches(tmp_path, monkeypatch):
+    """--agent-id does not silently choose between multiple matching logs."""
+    agent_id = "computer-task-duplicate"
+    msgs = [_msg("assistant", _ipython_block("computer('screenshot')"))]
+    _write_conv_jsonl(
+        tmp_path / f"subagent-{agent_id}-aaaa" / "conversation.jsonl", msgs
+    )
+    _write_conv_jsonl(
+        tmp_path / f"subagent-{agent_id}-bbbb" / "conversation.jsonl", msgs
+    )
+    monkeypatch.setattr("gptme.cli.cmd_computer.get_logs_dir", lambda: tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        audit_log, ["--agent-id", agent_id, "--json"], catch_exceptions=False
+    )
+    assert result.exit_code != 0
+    assert "multiple conversations found" in result.output
+    assert f"subagent-{agent_id}-aaaa" in result.output
+    assert f"subagent-{agent_id}-bbbb" in result.output
+
+
+def test_audit_log_agent_id_missing_prints_error(tmp_path, monkeypatch):
+    """--agent-id for a non-existent subagent prints an actionable error."""
+    monkeypatch.setattr("gptme.cli.cmd_computer.get_logs_dir", lambda: tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        audit_log, ["--agent-id", "computer-task-nothere"], catch_exceptions=False
+    )
+    assert result.exit_code != 0
+    assert "computer-task-nothere" in result.output
+
+
+def test_audit_log_agent_id_fallback_bare_name(tmp_path, monkeypatch):
+    """--agent-id falls back to a bare conversation name (no subagent- prefix)."""
+    agent_id = "computer-task-fallback1"
+    # Stored WITHOUT the "subagent-" prefix (e.g. legacy or subprocess mode)
+    conv_dir = tmp_path / agent_id
+    jsonl = conv_dir / "conversation.jsonl"
+    msgs = [
+        _msg(
+            "assistant", _ipython_block("computer('left_click', coordinate=(10, 20))")
+        ),
+    ]
+    _write_conv_jsonl(jsonl, msgs)
+    monkeypatch.setattr("gptme.cli.cmd_computer.get_logs_dir", lambda: tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        audit_log, ["--agent-id", agent_id, "--json"], catch_exceptions=False
+    )
+    assert result.exit_code == 0, result.output
+    records = json.loads(result.output)
+    assert len(records) == 1
+    assert records[0]["action"] == "left_click"
+
+
+def test_audit_log_agent_id_and_conversation_are_mutually_exclusive(
+    tmp_path, monkeypatch
+):
+    """Passing both selectors is rejected instead of silently ignoring one."""
+    monkeypatch.setattr("gptme.cli.cmd_computer.get_logs_dir", lambda: tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        audit_log,
+        ["some-session", "--agent-id", "computer-task-abc12345"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code != 0
+    assert "--agent-id and CONVERSATION are mutually exclusive" in result.output
