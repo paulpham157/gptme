@@ -444,6 +444,28 @@ class TestBatchJob:
         job = BatchJob(agent_ids=["x"])
         assert job.get_completed() == {}
 
+    def test_wait_all_does_not_raise_on_as_completed_timeout(self, monkeypatch):
+        """wait_all() must not propagate TimeoutError — stalled agents get a result dict."""
+        import threading
+
+        from gptme.tools.subagent import batch as batch_mod
+
+        blocker = threading.Event()
+
+        def stalling_wait(agent_id, timeout=None):
+            blocker.wait(timeout=timeout)
+            return {"status": "success", "result": "done"}
+
+        monkeypatch.setattr(batch_mod, "subagent_wait", stalling_wait)
+
+        job = BatchJob(agent_ids=["stall-1"])
+        # Must not raise — short timeout forces as_completed to fire TimeoutError
+        results = job.wait_all(timeout=1)
+
+        assert "stall-1" in results
+        assert results["stall-1"]["status"] in ("timeout", "failure", "success")
+        blocker.set()  # unblock the background thread
+
 
 # ---------------------------------------------------------------------------
 # resolve_role_defaults tests
@@ -2983,3 +3005,277 @@ class TestParentContextForwarding:
             _subagents[:] = [
                 s for s in _subagents if s.agent_id != "test-fallback-skip-system"
             ]
+
+
+# ---------------------------------------------------------------------------
+# BatchJob.wait_all() concurrency tests
+# ---------------------------------------------------------------------------
+
+
+class TestBatchJobWaitAll:
+    """Tests for BatchJob.wait_all() concurrent behavior."""
+
+    def setup_method(self):
+        """Clear global subagent registries before each test."""
+        with _subagents_lock:
+            _subagents.clear()
+        with _subagent_results_lock:
+            _subagent_results.clear()
+
+    def _register_done_subagent(self, agent_id: str, result: str = "done") -> None:
+        """Register a fake already-completed subagent."""
+        import threading
+        from unittest.mock import MagicMock
+
+        from gptme.tools.subagent.types import Subagent, _subagent_results
+
+        t = MagicMock(spec=threading.Thread)
+        t.is_alive.return_value = False
+        t.join = MagicMock()
+
+        sa = Subagent(
+            agent_id=agent_id,
+            prompt="test",
+            thread=t,
+            logdir=Path("/tmp/fake-log"),
+            model=None,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        with _subagent_results_lock:
+            _subagent_results[agent_id] = ReturnType("success", result)
+
+    def test_wait_all_returns_all_results(self):
+        """wait_all() returns one entry per agent."""
+        from gptme.tools.subagent.batch import BatchJob
+
+        self._register_done_subagent("w1", "result-1")
+        self._register_done_subagent("w2", "result-2")
+        self._register_done_subagent("w3", "result-3")
+
+        job = BatchJob(agent_ids=["w1", "w2", "w3"])
+        results = job.wait_all(timeout=5)
+
+        assert set(results.keys()) == {"w1", "w2", "w3"}
+        assert results["w1"]["status"] == "success"
+        assert results["w1"]["result"] == "result-1"
+        assert results["w3"]["result"] == "result-3"
+
+    def test_wait_all_concurrent_vs_sequential_order_independence(self):
+        """Concurrent wait_all() returns same keys regardless of insertion order."""
+        from gptme.tools.subagent.batch import BatchJob
+
+        self._register_done_subagent("c1", "x")
+        self._register_done_subagent("c2", "y")
+
+        job1 = BatchJob(agent_ids=["c1", "c2"])
+        job2 = BatchJob(agent_ids=["c2", "c1"])
+
+        r1 = job1.wait_all(timeout=5)
+        r2 = job2.wait_all(timeout=5)
+
+        assert set(r1.keys()) == set(r2.keys()) == {"c1", "c2"}
+
+    def test_wait_all_skips_already_collected(self):
+        """wait_all() skips agent_ids whose results are already in BatchJob.results."""
+        from gptme.tools.subagent.batch import BatchJob
+
+        self._register_done_subagent("skip1", "cached")
+
+        job = BatchJob(
+            agent_ids=["skip1"],
+            results={"skip1": ReturnType("success", "pre-cached")},
+        )
+        results = job.wait_all(timeout=5)
+        assert results["skip1"]["result"] == "pre-cached"
+
+    def test_wait_all_handles_missing_agent_gracefully(self):
+        """wait_all() reports failure for an agent_id not in the registry."""
+        from gptme.tools.subagent.batch import BatchJob
+
+        job = BatchJob(agent_ids=["ghost-agent"])
+        results = job.wait_all(timeout=1)
+
+        assert "ghost-agent" in results
+        assert results["ghost-agent"]["status"] == "failure"
+
+    def test_wait_all_futures_timeout_marks_all_timed_out(self, monkeypatch):
+        """wait_all() marks all agents timed-out when as_completed raises TimeoutError.
+
+        Exercises the FuturesTimeoutError catch path in wait_all() — the edge case
+        where as_completed itself times out before any future completes.
+        """
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+        import gptme.tools.subagent.batch as batch_mod
+        from gptme.tools.subagent.batch import BatchJob
+
+        def mock_as_completed(futures, timeout=None):
+            raise FuturesTimeoutError
+
+        monkeypatch.setattr(batch_mod, "as_completed", mock_as_completed)
+
+        self._register_done_subagent("agent-a", "not-reached")
+        self._register_done_subagent("agent-b", "not-reached")
+
+        job = BatchJob(agent_ids=["agent-a", "agent-b"])
+        results = job.wait_all(timeout=30)
+
+        assert set(results.keys()) == {"agent-a", "agent-b"}
+        assert results["agent-a"]["status"] == "timeout"
+        assert results["agent-b"]["status"] == "timeout"
+        assert "30s" in results["agent-a"]["result"]
+
+
+# ---------------------------------------------------------------------------
+# subagent_parallel tests
+# ---------------------------------------------------------------------------
+
+
+class TestSubagentParallel:
+    """Tests for subagent_parallel() fan-out helper."""
+
+    def setup_method(self):
+        with _subagents_lock:
+            _subagents.clear()
+        with _subagent_results_lock:
+            _subagent_results.clear()
+
+    def test_empty_tasks_returns_empty_list(self):
+        from gptme.tools.subagent.batch import subagent_parallel
+
+        assert subagent_parallel([]) == []
+
+    def test_returns_list_in_task_order(self, monkeypatch):
+        """Results are returned in the same order as tasks, not completion order."""
+        import gptme.tools.subagent.api as api_mod
+        from gptme.tools.subagent.batch import subagent_parallel
+        from gptme.tools.subagent.types import Subagent
+
+        task_order = []
+
+        def mock_subagent(agent_id, prompt, **kwargs):
+            task_order.append(agent_id)
+            # Register a fake completed subagent
+            import threading
+
+            t = MagicMock(spec=threading.Thread)
+            t.is_alive.return_value = False
+            t.join = MagicMock()
+            sa = Subagent(
+                agent_id=agent_id,
+                prompt=prompt,
+                thread=t,
+                logdir=Path("/tmp/fake-log"),
+                model=None,
+            )
+            with _subagents_lock:
+                _subagents.append(sa)
+            with _subagent_results_lock:
+                _subagent_results[agent_id] = ReturnType(
+                    "success", f"result-for-{agent_id}"
+                )
+
+        monkeypatch.setattr(api_mod, "subagent", mock_subagent)
+        # Also patch the import inside batch.py
+        import gptme.tools.subagent.batch as batch_mod
+
+        monkeypatch.setattr(batch_mod, "subagent", mock_subagent)
+
+        tasks = [("p-a", "prompt a"), ("p-b", "prompt b"), ("p-c", "prompt c")]
+        results = subagent_parallel(tasks, timeout=5)
+
+        assert len(results) == 3
+        assert results[0]["result"] == "result-for-p-a"
+        assert results[1]["result"] == "result-for-p-b"
+        assert results[2]["result"] == "result-for-p-c"
+        assert [r["status"] for r in results] == ["success", "success", "success"]
+
+    def test_failure_result_for_missing_agent(self, monkeypatch):
+        """If a subagent never registers, parallel returns failure for that slot."""
+        import gptme.tools.subagent.batch as batch_mod
+        from gptme.tools.subagent.batch import subagent_parallel
+
+        def mock_subagent(agent_id, prompt, **kwargs):
+            # Intentionally do NOT register anything
+            pass
+
+        monkeypatch.setattr(batch_mod, "subagent", mock_subagent)
+
+        results = subagent_parallel([("ghost", "do work")], timeout=1)
+
+        assert len(results) == 1
+        assert results[0]["status"] == "failure"
+
+    def test_passes_kwargs_to_each_subagent(self, monkeypatch):
+        """Keyword args (model, isolated, etc.) are forwarded to every subagent."""
+        import gptme.tools.subagent.batch as batch_mod
+        from gptme.tools.subagent.batch import subagent_parallel
+
+        captured_kwargs: list[dict] = []
+
+        def mock_subagent(agent_id, prompt, **kwargs):
+            captured_kwargs.append(kwargs)
+            import threading
+
+            t = MagicMock(spec=threading.Thread)
+            t.is_alive.return_value = False
+            t.join = MagicMock()
+            sa = __import__(
+                "gptme.tools.subagent.types", fromlist=["Subagent"]
+            ).Subagent(
+                agent_id=agent_id,
+                prompt=prompt,
+                thread=t,
+                logdir=Path("/tmp/fake-log"),
+                model=None,
+            )
+            with _subagents_lock:
+                _subagents.append(sa)
+            with _subagent_results_lock:
+                _subagent_results[agent_id] = ReturnType("success", "ok")
+
+        monkeypatch.setattr(batch_mod, "subagent", mock_subagent)
+
+        subagent_parallel(
+            [("k1", "p1"), ("k2", "p2")],
+            model="openai/gpt-4o-mini",
+            isolated=True,
+            timeout=5,
+        )
+
+        assert len(captured_kwargs) == 2
+        for kw in captured_kwargs:
+            assert kw.get("model") == "openai/gpt-4o-mini"
+            assert kw.get("isolated") is True
+
+    def test_startup_failure_cancels_already_started_agents(self, monkeypatch):
+        """If subagent() raises mid-loop, already-started agents are cancelled."""
+        import gptme.tools.subagent.batch as batch_mod
+        from gptme.tools.subagent.batch import subagent_parallel
+
+        started: list[str] = []
+        cancelled: list[str] = []
+        call_count = 0
+
+        def mock_subagent(agent_id, prompt, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise RuntimeError("simulated ACP setup failure")
+            started.append(agent_id)
+
+        def mock_cancel(agent_id):
+            cancelled.append(agent_id)
+            return f"cancelled {agent_id}"
+
+        monkeypatch.setattr(batch_mod, "subagent", mock_subagent)
+        monkeypatch.setattr(batch_mod, "subagent_cancel", mock_cancel)
+
+        with pytest.raises(RuntimeError, match="simulated ACP setup failure"):
+            subagent_parallel([("s-a", "p1"), ("s-b", "p2"), ("s-c", "p3")])
+
+        # First agent was started before the failure; it must be cancelled
+        assert "s-a" in cancelled
+        # Second agent failed to start, so nothing to cancel there
+        assert "s-b" not in cancelled
