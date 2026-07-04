@@ -288,3 +288,94 @@ def test_parse_multiple_tool_calls():
     # Check ordering by start position
     assert tooluses[0].start is not None and tooluses[1].start is not None
     assert tooluses[0].start < tooluses[1].start
+
+
+def test_execute_msg_pairs_unrunnable_structured_tooluse():
+    """A structured (tool-format) tool_use for a non-runnable tool must still
+    yield a tool_result carrying the same call_id.
+
+    Regression for gptme#554: a subagent race could transiently make a loaded
+    tool non-runnable; execute_msg used to silently drop such tool_uses, leaving
+    a dangling tool_use that the Anthropic API rejects with a hard 400. The fix
+    is mechanism-agnostic: any structured tool_use that isn't runnable gets a
+    paired error tool_result so the tool_use/tool_result contract always holds.
+    """
+    from gptme.message import Message
+    from gptme.tools import execute_msg, init_tools
+
+    init_tools(["read"])
+    set_tool_format("tool")
+
+    # A tool that is definitely not loaded -> get_tool() is None -> not runnable.
+    content = '@definitely_not_a_real_tool(toolu_ghost123): {"foo": "bar"}'
+    msg = Message("assistant", content)
+
+    results = list(execute_msg(msg))
+
+    paired = [m for m in results if m.call_id == "toolu_ghost123"]
+    assert len(paired) == 1, f"expected exactly one paired tool_result, got {results}"
+    assert paired[0].role == "system"
+    assert "not available" in paired[0].content
+
+
+def test_execute_msg_ignores_unrunnable_markdown_block():
+    """A markdown code block (call_id is None) is not an API tool_use, so a
+    non-runnable one must NOT produce a spurious tool_result."""
+    from gptme.message import Message
+    from gptme.tools import execute_msg, init_tools
+
+    init_tools(["read"])
+    set_tool_format("markdown")
+
+    # Not a real tool -> parsed (if at all) as non-runnable, no call_id.
+    content = "```definitely_not_a_real_tool\nsome content\n```"
+    msg = Message("assistant", content)
+
+    results = list(execute_msg(msg))
+    assert results == [], f"markdown non-tool block should yield nothing, got {results}"
+
+
+def test_execute_msg_drains_structured_tooluses_after_interrupt(monkeypatch):
+    """After a KeyboardInterrupt on tool N, all subsequent structured tool_uses
+    (call_id is not None) must still get paired tool_results.
+
+    Regression for gptme#554 interrupt path: the pre-fix `break` exited the
+    loop entirely, leaving any remaining structured tool_uses dangling and
+    causing the next API request to hard-400.
+    """
+    from gptme.message import Message
+    from gptme.tools import execute_msg, init_tools
+    from gptme.tools.base import ToolUse
+
+    init_tools(["read"])
+    set_tool_format("tool")
+
+    # Patch ToolUse.execute on the first call to raise KeyboardInterrupt.
+    original_execute = ToolUse.execute
+    call_count = 0
+
+    def execute_raise_once(self, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise KeyboardInterrupt
+        return original_execute(self, **kwargs)
+
+    monkeypatch.setattr(ToolUse, "execute", execute_raise_once)
+    # Also patch is_runnable to return True for both tool calls.
+    monkeypatch.setattr(ToolUse, "is_runnable", property(lambda self: True))
+
+    # Two structured tool_uses; the first will be interrupted.
+    content = (
+        '@definitely_not_a_real_tool(toolu_first123): {"foo": "bar"}\n'
+        '@definitely_not_a_real_tool(toolu_second456): {"baz": "qux"}'
+    )
+    msg = Message("assistant", content)
+
+    results = list(execute_msg(msg))
+
+    call_ids = {m.call_id for m in results if m.call_id is not None}
+    assert "toolu_first123" in call_ids, "interrupted tool_use must be paired"
+    assert "toolu_second456" in call_ids, (
+        "subsequent tool_use must also be paired after interrupt"
+    )
