@@ -205,6 +205,43 @@ class Subagent:
     # Wall-clock limit in seconds; when set, a watchdog auto-cancels after this time
     max_time: float | None = None
 
+    def _normalize_json_result(self, result: str) -> str:
+        """Normalize a complete-block result as canonical JSON.
+
+        When output_schema is set, the complete block content must be valid JSON.
+        If it parses as valid JSON, the result is returned as a canonical JSON string
+        (re-serialized for consistency). If it fails to parse, the original string
+        is returned unchanged so the caller still gets a result (parsing failure is
+        logged as a warning, not treated as a hard failure).
+
+        Note: this validates JSON *syntax*, not Pydantic schema conformance —
+        callers that need full schema validation should call
+        ``output_schema.model_validate(parsed)`` separately.
+
+        Args:
+            result: The raw text from the complete block.
+
+        Returns:
+            Canonical JSON string when output_schema is set and the result is valid
+            JSON; otherwise the original result string unchanged.
+        """
+        if self.output_schema is None:
+            return result
+        import json
+
+        try:
+            parsed = json.loads(result)
+            return json.dumps(parsed)
+        except json.JSONDecodeError as e:
+            logger.warning(
+                "Subagent '%s' output_schema set but complete block is not valid JSON: %s. "
+                "Returning raw result. Snippet: %.200r",
+                self.agent_id,
+                e,
+                result,
+            )
+            return result
+
     def get_log(self) -> "LogManager":
         # noreorder
         from ...logmanager import LogManager  # fmt: skip
@@ -271,6 +308,7 @@ class Subagent:
             # Don't silently fall back - make it clear when no summary was provided
             if complete_tool.content and complete_tool.content.strip():
                 result = complete_tool.content.strip()
+                result = self._normalize_json_result(result)
             else:
                 result = "Task completed (no summary provided)"
             return ReturnType(
@@ -288,6 +326,7 @@ class Subagent:
                 content = match.group(1).strip()
                 if content:
                     result = content
+                    result = self._normalize_json_result(result)
                 else:
                     result = "Task completed (no summary provided)"
                 return ReturnType(
