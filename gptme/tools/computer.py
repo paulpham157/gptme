@@ -101,7 +101,7 @@ import time
 from enum import Enum
 from typing import TYPE_CHECKING, Literal, TypedDict
 
-from ._computer_gate import sensitive_action_gate
+from ._computer_gate import action_risk_level, sensitive_action_gate
 from .base import ToolFunction, ToolSpec, ToolUse
 from .computer_transport import get_transport
 from .screenshot import screenshot
@@ -122,6 +122,58 @@ _sleep = time.sleep
 
 # Platform detection
 IS_MACOS = platform.system() == "Darwin"
+
+
+def _stream_action_risk(
+    action: str,
+    *,
+    text: str | None = None,
+    coordinate: tuple[int, int] | None = None,
+) -> None:
+    """Emit a live risk-label record to the parent agent's progress queue.
+
+    Called by ``computer()`` after sensitive-action gating succeeds.  When the
+    current execution context is a ``computer_task()`` subagent, the record is
+    forwarded to the parent agent via ``notify_progress()`` so the parent can
+    track each action's risk level in real-time rather than having to wait for
+    the subagent to finish and then call ``gptme-util computer audit-log``.
+
+    ``act_and_observe()`` delegates through ``computer()``, so it emits records
+    for the requested action and, on the local fallback path, for its internal
+    ``computer("wait_for_change")`` polling call.
+
+    Does nothing when:
+    - Not running inside a subagent (``get_current_agent_id()`` returns None)
+    - Any import or notification call raises an exception (never breaks the action)
+
+    The record format is a JSON object with keys:
+    - ``action``    — action name (e.g. ``"left_click"``)
+    - ``risk``      — risk level: ``"read"``, ``"write"``, or ``"sensitive"``
+    - ``coord``     — ``[x, y]`` for coordinate-based actions, absent otherwise
+    - ``text_len``  — byte-length of text for sensitive actions; absent otherwise
+                      (content is *never* emitted — only its length)
+    """
+    try:
+        import json as _json
+
+        from .subagent import get_current_agent_id, notify_progress
+
+        agent_id = get_current_agent_id()
+        if agent_id is None:
+            return
+
+        risk = action_risk_level(action)
+        record: dict = {"action": action, "risk": risk}
+        if coordinate is not None:
+            record["coord"] = list(coordinate)
+        if risk == "sensitive" and text is not None:
+            record["text_len"] = len(text.encode())
+
+        notify_progress(
+            agent_id, f"action:{_json.dumps(record, separators=(',', ':'))}"
+        )
+    except Exception:
+        pass  # never let streaming failures interrupt the action
 
 
 def _make_screenshot_msg(path: Path, tool: str = "computer") -> Message | None:
@@ -1443,6 +1495,15 @@ def computer(
         text: Text to type or key sequence to send
         coordinate: X,Y coordinates for mouse actions
     """
+    # Gate check before streaming: ensures blocked sensitive actions never emit
+    # a misleading progress record to the parent agent.  No-op for read/write
+    # actions; may raise PermissionError for sensitive ones when gating is on.
+    sensitive_action_gate(action, text)
+
+    # Emit a live risk-label record to the parent agent when running inside
+    # a computer_task() subagent.  This is a no-op in all other contexts.
+    _stream_action_risk(action, text=text, coordinate=coordinate)
+
     # Optional transport-layer dispatch (env: GPTME_COMPUTER_TRANSPORT)
     transport = get_transport()
     if transport:
@@ -1495,7 +1556,6 @@ def computer(
     if action in ("mouse_move", "left_click_drag"):
         if not coordinate:
             raise ValueError(f"coordinate is required for {action}")
-        sensitive_action_gate(action)
         x, y = _scale_coordinates(
             _ScalingSource.API, coordinate[0], coordinate[1], width, height
         )
@@ -1517,7 +1577,6 @@ def computer(
     if action in ("key", "type"):
         if not text:
             raise ValueError(f"text is required for {action}")
-        sensitive_action_gate(action, text)
 
         if IS_MACOS:
             if action == "key":
