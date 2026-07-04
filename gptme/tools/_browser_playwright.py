@@ -28,6 +28,7 @@ from ._browser_thread import (
     _is_connection_error,
     get_context_options,
 )
+from ._computer_gate import sensitive_action_gate
 
 _browser: BrowserThread | None = None
 _last_logs: dict = {"logs": [], "errors": [], "url": None}
@@ -747,6 +748,7 @@ def fill_element(selector: str, value: str) -> str:
     """
     if _current_page is None:
         raise RuntimeError("No page is open. Call open_page(url) first.")
+    sensitive_action_gate("fill_element", value, is_browser=True)
     logger.info(f"Filling element '{selector}' with value")
     return _execute_with_retry(_fill, selector, value)
 
