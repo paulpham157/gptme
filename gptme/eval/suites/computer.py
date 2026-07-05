@@ -5,6 +5,9 @@ Validates end-to-end computer-use workflows:
 - Backend selection policy: prefers snapshot_url / observe_web for web, not screenshot
 - Web content extraction and summarization
 - Interactive web actions: open_page, fill_element, click_element (the "Can it Tweet?" pipeline)
+- Keyboard navigation: press_key (Enter to submit, Tab to move focus)
+- Dropdown selection: select_option for <select> elements
+- Dynamic content: wait_for_element for elements that appear after user actions
 
 These tests run without a physical display because they use Playwright's
 headless mode via the browser tool. Desktop/screenshot tests that require
@@ -13,6 +16,7 @@ pipelines.
 """
 
 import logging
+import urllib.parse
 from typing import TYPE_CHECKING
 
 from gptme.message import Message
@@ -22,6 +26,29 @@ if TYPE_CHECKING:
     from gptme.eval.types import EvalSpec
 
 logger = logging.getLogger(__name__)
+
+# Self-contained fixture with a real <select> element (httpbin's /forms/post
+# renders "size" as radio buttons, not a <select>, so select_option() would
+# raise against it — see gptme#3097 review discussion). The result marker is
+# only written by a JS "change" listener, so a passing check proves the tool
+# actually drove the <select>, not that "large" happens to appear in static
+# markup.
+_DROPDOWN_FIXTURE_HTML = (
+    "<!doctype html><html><body>"
+    '<form><select name="size" id="size">'
+    '<option value="small">Small</option>'
+    '<option value="medium">Medium</option>'
+    '<option value="large">Large</option>'
+    "</select></form>"
+    '<div id="result">no selection</div>'
+    "<script>"
+    "document.getElementById('size').addEventListener('change', function(e) {"
+    "document.getElementById('result').textContent = 'selected:' + e.target.value;"
+    "});"
+    "</script>"
+    "</body></html>"
+)
+_DROPDOWN_FIXTURE_URL = "data:text/html," + urllib.parse.quote(_DROPDOWN_FIXTURE_HTML)
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +115,21 @@ def check_used_open_page_or_click_element(messages: list[Message]) -> bool:
         "open_page(" in code or "click_element(" in code
         for code in _executed_tool_calls(messages)
     )
+
+
+def check_used_press_key(messages: list[Message]) -> bool:
+    """Agent must use press_key() for keyboard-driven interaction (not click for submit)."""
+    return any("press_key(" in code for code in _executed_tool_calls(messages))
+
+
+def check_used_select_option(messages: list[Message]) -> bool:
+    """Agent must use select_option() for dropdown interaction."""
+    return any("select_option(" in code for code in _executed_tool_calls(messages))
+
+
+def check_used_wait_for_element(messages: list[Message]) -> bool:
+    """Agent must use wait_for_element() to wait for dynamically-rendered content."""
+    return any("wait_for_element(" in code for code in _executed_tool_calls(messages))
 
 
 def check_did_not_screenshot_for_web(messages: list[Message]) -> bool:
@@ -173,6 +215,27 @@ def _expect_second_page_reached(ctx) -> bool:
     if isinstance(content, bytes):
         content = content.decode(errors="replace")
     return len(content.strip()) > 5
+
+
+def _expect_keyboard_submit_reflected(ctx) -> bool:
+    # httpbin echoes submitted field names in the response JSON (e.g. {"custname": "..."}).
+    # Checking for the field key "custname" (not the user-supplied value "TestUser") avoids
+    # false positives where the agent narrates what it attempted without actually submitting.
+    return "custname" in ctx.stdout
+
+
+def _expect_dropdown_result_written(ctx) -> bool:
+    return "dropdown.txt" in ctx.files or len(ctx.stdout.strip()) > 5
+
+
+def _expect_dropdown_value_echoed(ctx) -> bool:
+    # The fixture page only writes "selected:large" via a JS "change" listener
+    # fired by a real select_option() call — the marker text is absent from the
+    # static HTML, so this can't pass on narration or an unexecuted tool call.
+    content = ctx.files.get("dropdown.txt", ctx.stdout)
+    if isinstance(content, bytes):
+        content = content.decode(errors="replace")
+    return "selected:large" in content
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +340,93 @@ tests: list["EvalSpec"] = [
         },
         "check_log": {
             "used open_page or click_element for navigation": check_used_open_page_or_click_element,
+        },
+    },
+    # --- Keyboard navigation tests ---
+    # Validates press_key() for submitting forms without click_element, mirroring
+    # workflows like Twitter where pressing Enter submits the compose box directly.
+    {
+        "name": "computer-use-web-keyboard-submit",
+        "files": {},
+        "run": "cat result.txt",
+        "prompt": (
+            "You are in computer-use mode. Use keyboard navigation to submit a web form:\n"
+            "1. Call open_page('https://httpbin.org/forms/post') to open the pizza order form.\n"
+            "2. Call fill_element('[name=\"custname\"]', 'TestUser') to fill the customer name.\n"
+            "3. Call fill_element('[name=\"custemail\"]', 'test@example.com') to fill the email.\n"
+            "4. Call press_key('Tab') to move focus to the next field, then "
+            "call press_key('Return') to submit the form using the keyboard (do NOT use click_element for submit).\n"
+            "5. Call read_page_text() to read the response.\n"
+            "6. Write the response (or a summary) to result.txt."
+        ),
+        "tools": ["browser", "computer", "vision", "ipython", "save"],
+        "expect": {
+            "result.txt written": _expect_result_written,
+            "form submitted (custname reflected)": _expect_keyboard_submit_reflected,
+            "clean exit": _expect_clean_exit,
+        },
+        "check_log": {
+            "used open_page for navigation": check_used_open_page,
+            "used fill_element for input": check_used_fill_element,
+            "used press_key for keyboard submission": check_used_press_key,
+        },
+    },
+    # --- Dropdown selection test ---
+    # Validates select_option() for <select> elements. Uses a self-contained
+    # data: URL fixture (not httpbin) because httpbin's /forms/post renders
+    # "size" as radio buttons, not a <select> — select_option() would raise
+    # against it, and any static-text check would be a false positive since
+    # "large" is already present in that page's radio-button label.
+    {
+        "name": "computer-use-web-dropdown-select",
+        "files": {},
+        "run": "cat dropdown.txt",
+        "prompt": (
+            "You are in computer-use mode. Use select_option() to choose a dropdown value:\n"
+            f"1. Call open_page('{_DROPDOWN_FIXTURE_URL}') to open a page with a size dropdown.\n"
+            "2. Call select_option('[name=\"size\"]', 'large') to pick the pizza size.\n"
+            "3. Call read_page_text() to read the updated page content.\n"
+            "4. Write the response (or a summary confirming the size selection) to dropdown.txt."
+        ),
+        "tools": ["browser", "computer", "vision", "ipython", "save"],
+        "expect": {
+            "dropdown.txt written": _expect_dropdown_result_written,
+            "selection reflected in response": _expect_dropdown_value_echoed,
+            "clean exit": _expect_clean_exit,
+        },
+        "check_log": {
+            "used select_option for dropdown": check_used_select_option,
+            "used open_page for navigation": check_used_open_page,
+        },
+    },
+    # --- Dynamic-content waiting test ---
+    # Validates wait_for_element() for pages where elements may not be immediately
+    # ready (JS-rendered content, delayed DOM updates, SPAs after navigation).
+    # httpbin /forms/post is used as the host page; the agent must call
+    # wait_for_element() before filling to exercise the tool.
+    {
+        "name": "computer-use-web-wait-for-element",
+        "files": {},
+        "run": "cat result.txt",
+        "prompt": (
+            "You are in computer-use mode. Use wait_for_element() to confirm an element is ready before interacting:\n"
+            "1. Call open_page('https://httpbin.org/forms/post') to open the pizza order form.\n"
+            "2. Call wait_for_element('[name=\"custname\"]') to wait until the customer name field is present in the DOM.\n"
+            "3. Call fill_element('[name=\"custname\"]', 'WaitUser') to fill the customer name field.\n"
+            "4. Call click_element('[type=\"submit\"]') to submit the form.\n"
+            "5. Call read_page_text() to read the response.\n"
+            "6. Write the response (or a summary) to result.txt."
+        ),
+        "tools": ["browser", "computer", "vision", "ipython", "save"],
+        "expect": {
+            "result.txt written": _expect_result_written,
+            "form submitted (custname reflected)": _expect_form_submitted,
+            "clean exit": _expect_clean_exit,
+        },
+        "check_log": {
+            "used wait_for_element before interaction": check_used_wait_for_element,
+            "used open_page for navigation": check_used_open_page,
+            "used fill_element for input": check_used_fill_element,
         },
     },
 ]
