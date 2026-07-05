@@ -702,6 +702,38 @@ class TestSubagentCancel:
         assert status == "clarification_needed"
         assert "Which format" in summary
 
+    def test_subprocess_monitor_preserves_token_counts(self, tmp_path):
+        logdir = tmp_path / "proc-token-log"
+        logdir.mkdir()
+        (logdir / "conversation.jsonl").write_text(
+            json.dumps(
+                {
+                    "role": "assistant",
+                    "content": "```complete\nDone.\n```",
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "metadata": {"usage": {"input_tokens": 123, "output_tokens": 45}},
+                }
+            )
+            + "\n"
+        )
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = 0
+        mock_proc.returncode = 0
+        sa = self._register(
+            "proc-token",
+            process=mock_proc,
+            execution_mode="subprocess",
+            logdir=logdir,
+        )
+
+        _monitor_subprocess(sa)
+
+        with _subagent_results_lock:
+            result = _subagent_results["proc-token"]
+        assert result.status == "success"
+        assert result.input_tokens == 123
+        assert result.output_tokens == 45
+
     def test_cancel_thread_marks_result(self):
         mock_thread = MagicMock(spec=threading.Thread)
         mock_thread.is_alive.return_value = True
@@ -4021,3 +4053,304 @@ class TestSubagentBatchNewParameters:
         assert len(captured) == 2
         for kw in captured:
             assert kw.get("context_turns") == 5
+
+
+# ---------------------------------------------------------------------------
+# Token budget tracking tests
+# ---------------------------------------------------------------------------
+
+
+class TestTokenBudgetTracking:
+    """Tests for token budget tracking in ReturnType, Subagent._read_token_stats(), and BatchJob."""
+
+    def test_return_type_default_token_fields_are_none(self):
+        """ReturnType defaults to None for both token fields."""
+        rt = ReturnType("success", "done")
+        assert rt.input_tokens is None
+        assert rt.output_tokens is None
+
+    def test_return_type_stores_token_counts(self):
+        """ReturnType stores input_tokens and output_tokens when provided."""
+        rt = ReturnType("success", "done", input_tokens=1000, output_tokens=200)
+        assert rt.input_tokens == 1000
+        assert rt.output_tokens == 200
+
+    def test_read_token_stats_with_usage_metadata(self, tmp_path):
+        """_read_token_stats() reads input/output tokens from conversation.jsonl."""
+        import json
+
+        logdir = tmp_path / "test-agent"
+        logdir.mkdir()
+        conv_file = logdir / "conversation.jsonl"
+
+        # Write a log with two assistant messages that have usage metadata
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {
+                "role": "assistant",
+                "content": "Hello!",
+                "metadata": {"usage": {"input_tokens": 100, "output_tokens": 50}},
+            },
+            {
+                "role": "assistant",
+                "content": "Done.",
+                "metadata": {"usage": {"input_tokens": 150, "output_tokens": 80}},
+            },
+        ]
+        with open(conv_file, "w") as f:
+            f.writelines(json.dumps(msg) + "\n" for msg in messages)
+
+        sa = Subagent(
+            agent_id="test-token-read",
+            prompt="test",
+            thread=None,
+            logdir=logdir,
+            model=None,
+        )
+        in_tok, out_tok = sa._read_token_stats()
+        assert in_tok == 250  # 100 + 150
+        assert out_tok == 130  # 50 + 80
+
+    def test_read_token_stats_with_cache_tokens(self, tmp_path):
+        """_read_token_stats() sums cache_read and cache_creation tokens into input."""
+        import json
+
+        logdir = tmp_path / "test-agent-cache"
+        logdir.mkdir()
+        conv_file = logdir / "conversation.jsonl"
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Cached response.",
+                "metadata": {
+                    "usage": {
+                        "input_tokens": 100,
+                        "cache_read_tokens": 200,
+                        "cache_creation_tokens": 50,
+                        "output_tokens": 30,
+                    }
+                },
+            },
+        ]
+        with open(conv_file, "w") as f:
+            f.writelines(json.dumps(msg) + "\n" for msg in messages)
+
+        sa = Subagent(
+            agent_id="test-token-cache",
+            prompt="test",
+            thread=None,
+            logdir=logdir,
+            model=None,
+        )
+        in_tok, out_tok = sa._read_token_stats()
+        assert in_tok == 350  # 100 + 200 (cache_read) + 50 (cache_creation)
+        assert out_tok == 30
+
+    def test_read_token_stats_returns_none_when_no_metadata(self, tmp_path):
+        """_read_token_stats() returns (None, None) when no usage metadata is present."""
+        import json
+
+        logdir = tmp_path / "test-agent-no-meta"
+        logdir.mkdir()
+        conv_file = logdir / "conversation.jsonl"
+
+        messages = [
+            {"role": "system", "content": "System prompt."},
+            {"role": "assistant", "content": "Response without metadata."},
+        ]
+        with open(conv_file, "w") as f:
+            f.writelines(json.dumps(msg) + "\n" for msg in messages)
+
+        sa = Subagent(
+            agent_id="test-no-meta",
+            prompt="test",
+            thread=None,
+            logdir=logdir,
+            model=None,
+        )
+        in_tok, out_tok = sa._read_token_stats()
+        assert in_tok is None
+        assert out_tok is None
+
+    def test_read_token_stats_preserves_zero_token_metadata(self, tmp_path):
+        """_read_token_stats() returns zeroes when usage metadata is present but zero."""
+        import json
+
+        logdir = tmp_path / "test-agent-zero-usage"
+        logdir.mkdir()
+        conv_file = logdir / "conversation.jsonl"
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Zero usage response.",
+                "metadata": {"usage": {"input_tokens": 0, "output_tokens": 0}},
+            },
+        ]
+        with open(conv_file, "w") as f:
+            f.writelines(json.dumps(msg) + "\n" for msg in messages)
+
+        sa = Subagent(
+            agent_id="test-zero-usage",
+            prompt="test",
+            thread=None,
+            logdir=logdir,
+            model=None,
+        )
+        in_tok, out_tok = sa._read_token_stats()
+        assert in_tok == 0
+        assert out_tok == 0
+
+    def test_read_token_stats_returns_none_when_logdir_missing(self, tmp_path):
+        """_read_token_stats() returns (None, None) gracefully when logdir doesn't exist."""
+        sa = Subagent(
+            agent_id="test-no-log",
+            prompt="test",
+            thread=None,
+            logdir=tmp_path / "nonexistent-agent",
+            model=None,
+        )
+        in_tok, out_tok = sa._read_token_stats()
+        assert in_tok is None
+        assert out_tok is None
+
+    def test_acp_completion_preserves_token_counts(self, tmp_path, monkeypatch):
+        """ACP mode caches token fields read from the subagent conversation log."""
+        import gptme.acp.client as acp_client
+
+        cli_main = importlib.import_module("gptme.cli.main")
+        logdir = tmp_path / "subagent-acp-token"
+        monkeypatch.setattr(cli_main, "get_logdir", lambda name: logdir)
+
+        with _subagents_lock:
+            _subagents.clear()
+        with _subagent_results_lock:
+            _subagent_results.clear()
+        while not _completion_queue.empty():
+            try:
+                _completion_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        class FakeUpdate:
+            type = "agent_message_chunk"
+            chunk = {"text": "ACP completed."}
+
+        class FakeRunResult:
+            stop_reason = "end_turn"
+
+        class FakeAcpClient:
+            def __init__(self, *args, on_update=None, **kwargs):
+                self.on_update = on_update
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def run(self, prompt, cwd=None):
+                logdir.mkdir(parents=True, exist_ok=True)
+                (logdir / "conversation.jsonl").write_text(
+                    json.dumps(
+                        {
+                            "role": "assistant",
+                            "content": "ACP completed.",
+                            "metadata": {
+                                "usage": {
+                                    "input_tokens": 321,
+                                    "output_tokens": 54,
+                                }
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                if self.on_update:
+                    self.on_update("session-1", FakeUpdate())
+                return FakeRunResult()
+
+        monkeypatch.setattr(acp_client, "GptmeAcpClient", FakeAcpClient)
+
+        subagent_api.subagent("acp-token", "test prompt", use_acp=True)
+
+        with _subagents_lock:
+            sa = next(s for s in _subagents if s.agent_id == "acp-token")
+        assert sa.thread is not None
+        sa.thread.join(timeout=5)
+        assert not sa.thread.is_alive()
+
+        with _subagent_results_lock:
+            result = _subagent_results["acp-token"]
+        assert result.status == "success"
+        assert result.result == "ACP completed."
+        assert result.input_tokens == 321
+        assert result.output_tokens == 54
+
+    def test_batch_job_total_tokens_sums_all_results(self):
+        """BatchJob.total_tokens() sums input/output tokens from all completed results."""
+        job = BatchJob(agent_ids=["a", "b", "c"])
+        job.results["a"] = ReturnType(
+            "success", "done", input_tokens=1000, output_tokens=100
+        )
+        job.results["b"] = ReturnType(
+            "success", "done", input_tokens=2000, output_tokens=200
+        )
+        job.results["c"] = ReturnType(
+            "failure", "error", input_tokens=500, output_tokens=50
+        )
+
+        stats = job.total_tokens()
+        assert stats["input_tokens"] == 3500
+        assert stats["output_tokens"] == 350
+
+    def test_batch_job_total_tokens_returns_none_when_no_data(self):
+        """BatchJob.total_tokens() returns None values when no subagent has token data."""
+        job = BatchJob(agent_ids=["a", "b"])
+        job.results["a"] = ReturnType("success", "done")
+        job.results["b"] = ReturnType("failure", "error")
+
+        stats = job.total_tokens()
+        assert stats["input_tokens"] is None
+        assert stats["output_tokens"] is None
+
+    def test_batch_job_total_tokens_partial_data(self):
+        """BatchJob.total_tokens() sums only available data when some subagents lack token info."""
+        job = BatchJob(agent_ids=["a", "b"])
+        job.results["a"] = ReturnType(
+            "success", "done", input_tokens=1000, output_tokens=100
+        )
+        job.results["b"] = ReturnType("failure", "error")  # No token data
+
+        stats = job.total_tokens()
+        assert stats["input_tokens"] == 1000  # Only from 'a'
+        assert stats["output_tokens"] == 100
+
+    def test_batch_job_wait_all_preserves_token_counts(self):
+        """BatchJob.wait_all() stores token fields returned by subagent_wait()."""
+        from unittest.mock import patch
+
+        def fake_wait(agent_id, timeout=60, max_result_chars=2000):
+            tokens = {
+                "a": {"input_tokens": 1000, "output_tokens": 100},
+                "b": {"input_tokens": 2000, "output_tokens": 200},
+            }[agent_id]
+            return {"status": "success", "result": f"{agent_id} done", **tokens}
+
+        job = BatchJob(agent_ids=["a", "b"])
+        with patch("gptme.tools.subagent.batch.subagent_wait", side_effect=fake_wait):
+            results = job.wait_all(timeout=5)
+
+        assert results["a"]["input_tokens"] == 1000
+        assert results["a"]["output_tokens"] == 100
+        stats = job.total_tokens()
+        assert stats["input_tokens"] == 3000
+        assert stats["output_tokens"] == 300
+
+    def test_batch_job_total_tokens_empty_results(self):
+        """BatchJob.total_tokens() returns None when no results are present yet."""
+        job = BatchJob(agent_ids=["a", "b"])
+        stats = job.total_tokens()
+        assert stats["input_tokens"] is None
+        assert stats["output_tokens"] is None
