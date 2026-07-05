@@ -21,7 +21,13 @@ from .init import init
 from .llm import reply
 from .llm.models import get_default_model, get_model
 from .logmanager import Log, LogManager, prepare_messages
-from .message import Message, get_output_format, is_output_json, set_output_format
+from .message import (
+    Message,
+    get_output_format,
+    is_output_json,
+    is_output_quiet,
+    set_output_format,
+)
 from .prompt_queue import drain_prompt_queue
 from .telemetry import set_conversation_context, trace_function
 from .tools import (
@@ -121,20 +127,20 @@ def chat(
             )
             stream = False
 
-        if not is_output_json():
+        if not is_output_json() and not is_output_quiet():
             console.log(f"Using logdir: {path_with_tilde(logdir)}")
         manager = LogManager.load(logdir, initial_msgs=initial_msgs, create=True)
 
         # Note: todo replay is now handled via SESSION_START hook
 
         # Initialize workspace
-        if not is_output_json():
+        if not is_output_json() and not is_output_quiet():
             console.log(f"Using workspace: {path_with_tilde(workspace)}")
         require_workspace_exists(workspace)
         os.chdir(workspace)
 
-        # print log (suppressed in JSON output mode)
-        if not is_output_json():
+        # print log (suppressed in JSON output mode and in quiet mode)
+        if not is_output_json() and not is_output_quiet():
             manager.log.print(show_hidden=show_hidden)
             console.print("--- ^^^ past messages ^^^ ---")
 
@@ -158,7 +164,7 @@ def chat(
             output_schema=output_schema,
         )
     except SessionCompleteException as e:
-        if not is_output_json():
+        if not is_output_json() and not is_output_quiet():
             console.log(f"Autonomous mode: {e}. Exiting.")
 
         # Trigger session end hooks
@@ -299,7 +305,7 @@ def _run_chat_loop(
                 continue  # Process the queued messages
 
         except KeyboardInterrupt:
-            if not is_output_json():
+            if not is_output_json() and not is_output_quiet():
                 console.log("Interrupted.")
             manager.append(Message("system", INTERRUPT_CONTENT))
             # Clear any remaining prompts to avoid confusion
@@ -375,7 +381,7 @@ def _process_message_conversation(
                 )
             )
         except KeyboardInterrupt:
-            if not is_output_json():
+            if not is_output_json() and not is_output_quiet():
                 console.log("Interrupted during response generation.")
             manager.append(Message("system", INTERRUPT_CONTENT))
             break
@@ -391,7 +397,7 @@ def _process_message_conversation(
         # Check if user declined execution - return to prompt without generating response
         # This makes "n" at confirm prompt behave like Ctrl+C (return to user prompt)
         if any(msg.content == DECLINED_CONTENT for msg in response_msgs):
-            if not is_output_json():
+            if not is_output_json() and not is_output_quiet():
                 console.log("Execution declined, returning to prompt.")
             break
 
@@ -418,7 +424,7 @@ def _process_message_conversation(
         # Check step limit (GPTME_MAX_STEPS)
         step_count += 1
         if max_steps is not None and step_count >= max_steps:
-            if not is_output_json():
+            if not is_output_json() and not is_output_quiet():
                 console.log(f"Reached max steps limit ({max_steps}), stopping.")
             manager.append(
                 Message("system", f"Stopped: reached max steps limit ({max_steps})")
