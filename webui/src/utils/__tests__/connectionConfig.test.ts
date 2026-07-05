@@ -8,16 +8,26 @@ const mockFindOrCreateServerByUrl = jest.fn((baseUrl: string, config: Record<str
 }));
 const mockGetActiveServer = jest.fn(() => null);
 const mockSetActiveServer = jest.fn();
+const mockConnectServer = jest.fn();
 const mockUpdateServer = jest.fn();
 
 jest.mock('@/stores/servers', () => ({
   findOrCreateServerByUrl: mockFindOrCreateServerByUrl,
+  connectServer: mockConnectServer,
   getActiveServer: mockGetActiveServer,
   setActiveServer: mockSetActiveServer,
   updateServer: mockUpdateServer,
 }));
 
-import { processConnectionFromHash, resolveCloudExchangeBaseUrl } from '../connectionConfig';
+import {
+  getConnectionConfigFromSources,
+  processConnectionFromHash,
+  resolveCloudExchangeBaseUrl,
+} from '../connectionConfig';
+
+const runtimeEnvWindow = window as typeof window & {
+  __GPTME_WEBUI_ENV__?: Record<string, string | undefined>;
+};
 
 describe('resolveCloudExchangeBaseUrl', () => {
   it('routes the managed app default through fleet for auth-code exchange', () => {
@@ -44,6 +54,7 @@ describe('processConnectionFromHash', () => {
 
   beforeEach(() => {
     mockFindOrCreateServerByUrl.mockClear();
+    mockConnectServer.mockClear();
     mockGetActiveServer.mockClear();
     mockSetActiveServer.mockClear();
     mockUpdateServer.mockClear();
@@ -65,6 +76,7 @@ describe('processConnectionFromHash', () => {
 
   afterEach(() => {
     global.fetch = originalFetch;
+    delete runtimeEnvWindow.__GPTME_WEBUI_ENV__;
   });
 
   it('posts auth-code exchange to fleet.gptme.ai by default', async () => {
@@ -86,9 +98,60 @@ describe('processConnectionFromHash', () => {
       }
     );
     expect(mockSetActiveServer).toHaveBeenCalledWith('server-1');
+    expect(mockConnectServer).toHaveBeenCalledWith('server-1');
     expect(result).toEqual({
       baseUrl: 'https://instance-123.fleet.gptme.ai',
       authToken: 'token-123',
+      useAuthToken: true,
+    });
+  });
+
+  it('posts auth-code exchange to explicit browser runtime fleet URL', async () => {
+    runtimeEnvWindow.__GPTME_WEBUI_ENV__ = {
+      VITE_GPTME_FLEET_BASE_URL: 'http://fleet.gptme.local:8080',
+    };
+
+    const result = await processConnectionFromHash('code=local-ci-code');
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      'http://fleet.gptme.local:8080/api/v1/operator/auth/exchange',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: 'local-ci-code' }),
+      })
+    );
+    expect(mockFindOrCreateServerByUrl).toHaveBeenCalledWith(
+      'https://instance-123.fleet.gptme.ai',
+      {
+        authToken: 'token-123',
+        useAuthToken: true,
+      }
+    );
+    expect(mockConnectServer).toHaveBeenCalledWith('server-1');
+    expect(mockSetActiveServer).toHaveBeenCalledWith('server-1');
+    expect(result).toEqual({
+      baseUrl: 'https://instance-123.fleet.gptme.ai',
+      authToken: 'token-123',
+      useAuthToken: true,
+    });
+  });
+
+  it('connects the registered server from legacy fragment URL config', () => {
+    const result = getConnectionConfigFromSources(
+      'baseUrl=https://legacy.example.com&userToken=legacy-token'
+    );
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(mockFindOrCreateServerByUrl).toHaveBeenCalledWith('https://legacy.example.com', {
+      authToken: 'legacy-token',
+      useAuthToken: true,
+    });
+    expect(mockConnectServer).toHaveBeenCalledWith('server-1');
+    expect(mockSetActiveServer).toHaveBeenCalledWith('server-1');
+    expect(result).toEqual({
+      baseUrl: 'https://legacy.example.com',
+      authToken: 'legacy-token',
       useAuthToken: true,
     });
   });
@@ -106,6 +169,7 @@ describe('processConnectionFromHash', () => {
 
     // Registry should not be mutated on failed exchange
     expect(mockFindOrCreateServerByUrl).not.toHaveBeenCalled();
+    expect(mockConnectServer).not.toHaveBeenCalled();
     expect(mockSetActiveServer).not.toHaveBeenCalled();
   });
 });

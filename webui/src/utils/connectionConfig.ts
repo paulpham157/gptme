@@ -1,5 +1,6 @@
 import {
   findOrCreateServerByUrl,
+  connectServer,
   getActiveServer,
   setActiveServer,
   updateServer,
@@ -9,8 +10,18 @@ const DEFAULT_API_URL = 'http://127.0.0.1:5700';
 const DEFAULT_CLOUD_APP_BASE_URL = 'https://gptme.ai';
 const DEFAULT_CLOUD_EXCHANGE_BASE_URL = 'https://fleet.gptme.ai';
 
+declare global {
+  interface Window {
+    __GPTME_WEBUI_ENV__?: Record<string, string | undefined>;
+  }
+}
+
 function trimTrailingSlash(url: string): string {
   return url.replace(/\/+$/, '');
+}
+
+function isUnsetViteHtmlPlaceholder(value: string): boolean {
+  return /^%VITE_[A-Z0-9_]+%$/.test(value);
 }
 
 /**
@@ -25,30 +36,40 @@ export function isDemoMode(): boolean {
   return new URLSearchParams(window.location.search).get('demo') === '1';
 }
 
-// Vite statically replaces `import.meta.env.VITE_*` at build time for browser
-// bundles. Jest can't parse import.meta syntax (it's ESM-only), so we wrap it
-// in a Function() body to defer evaluation, then fall back to process.env
-// shimmed by jest.setup.ts. All three env vars (CLOUD_BASE_URL, FLEET_BASE_URL,
-// API_URL) will silently fall through to hardcoded defaults in browsers — a
-// known limitation also present in SetupWizard.tsx.
+// Browser builds can inject runtime env from index.html before this module
+// loads. Keep process.env fallback for Jest/Node tests; the Function() path is
+// retained only for compatibility with any bundler that supports it.
 function getEnvVar(name: string): string | undefined {
+  if (typeof window !== 'undefined') {
+    const value = window.__GPTME_WEBUI_ENV__?.[name];
+    if (value && !isUnsetViteHtmlPlaceholder(value)) {
+      return value;
+    }
+  }
+
   try {
-    return Function(`return import.meta.env.${name}`)() as string | undefined;
+    const value = Function(`return import.meta.env.${name}`)() as string | undefined;
+    if (value && !isUnsetViteHtmlPlaceholder(value)) {
+      return value;
+    }
   } catch {
     // Jest / Node runtime (import.meta not available)
     if (typeof process !== 'undefined' && process.env) {
-      return process.env[name];
+      const value = process.env[name];
+      if (value && !isUnsetViteHtmlPlaceholder(value)) {
+        return value;
+      }
     }
-    return undefined;
   }
+  return undefined;
 }
 
 // The browser auth UI lives on gptme.ai, but the auth-code exchange POST is
 // handled by the fleet operator. For custom single-origin deployments, keep the
 // previous "same origin" behavior unless an explicit fleet base URL is set.
-const CLOUD_APP_BASE_URL = trimTrailingSlash(
-  getEnvVar('VITE_GPTME_CLOUD_BASE_URL') || DEFAULT_CLOUD_APP_BASE_URL
-);
+function getCloudAppBaseUrl(): string {
+  return trimTrailingSlash(getEnvVar('VITE_GPTME_CLOUD_BASE_URL') || DEFAULT_CLOUD_APP_BASE_URL);
+}
 
 export function resolveCloudExchangeBaseUrl(
   cloudAppBaseUrl: string,
@@ -63,10 +84,9 @@ export function resolveCloudExchangeBaseUrl(
   return trimTrailingSlash(cloudAppBaseUrl);
 }
 
-const CLOUD_EXCHANGE_BASE_URL = resolveCloudExchangeBaseUrl(
-  CLOUD_APP_BASE_URL,
-  getEnvVar('VITE_GPTME_FLEET_BASE_URL')
-);
+function getCloudExchangeBaseUrl(): string {
+  return resolveCloudExchangeBaseUrl(getCloudAppBaseUrl(), getEnvVar('VITE_GPTME_FLEET_BASE_URL'));
+}
 
 export interface ConnectionConfig {
   baseUrl: string;
@@ -141,7 +161,7 @@ function getAuthCodeParams(hash?: string): { code: string } | null {
  * the managed-service default or the custom cloud app origin.
  */
 function getExchangeUrl(): string {
-  return `${CLOUD_EXCHANGE_BASE_URL}/api/v1/operator/auth/exchange`;
+  return `${getCloudExchangeBaseUrl()}/api/v1/operator/auth/exchange`;
 }
 
 export function getConnectionConfigFromSources(hash?: string): ConnectionConfig {
@@ -157,6 +177,7 @@ export function getConnectionConfigFromSources(hash?: string): ConnectionConfig 
       authToken: fragmentUserToken || null,
       useAuthToken: Boolean(fragmentUserToken),
     });
+    connectServer(server.id);
     setActiveServer(server.id);
 
     // Clean fragment from URL
@@ -223,6 +244,7 @@ export async function processConnectionFromHash(hash?: string): Promise<Connecti
         authToken: result.userToken,
         useAuthToken: true,
       });
+      connectServer(server.id);
       setActiveServer(server.id);
 
       // Clean fragment from URL
