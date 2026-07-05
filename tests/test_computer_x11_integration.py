@@ -7,7 +7,7 @@ These tests are the counterpart to ``test_computer_use_integration.py``
 (which covers the browser/Playwright path).  Together they prove both legs
 of the computer-use stack work end-to-end.
 
-Run manually (requires xdotool, scrot, Xvfb, xterm, fluxbox):
+Run manually (requires xdotool, scrot, Xvfb, xterm, fluxbox, ImageMagick):
     pytest tests/test_computer_x11_integration.py -v -m x11
 
 Marked ``x11`` and automatically skipped when the required tools are absent,
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-_REQUIRED_X11_TOOLS = ("Xvfb", "xdotool", "scrot", "xterm", "fluxbox")
+_REQUIRED_X11_TOOLS = ("Xvfb", "xdotool", "scrot", "xterm", "fluxbox", "convert")
 _MISSING_X11_TOOLS = [c for c in _REQUIRED_X11_TOOLS if not shutil.which(c)]
 
 pytestmark = pytest.mark.skipif(
@@ -94,14 +94,32 @@ def xvfb_display() -> Generator[str, None, None]:
         proc.kill()
         pytest.skip("Xvfb did not start within 10s")
 
-    # Start a minimal window manager so window_focus works
+    # Start a minimal window manager so window_focus / windowactivate work.
+    # Wait up to 3s for it to accept EWMH requests (CI can be slow).
     wm_proc = subprocess.Popen(
         ["fluxbox"],
         env={**os.environ, "DISPLAY": display},
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    time.sleep(0.5)  # let fluxbox initialise
+    wm_deadline = time.monotonic() + 3
+    while time.monotonic() < wm_deadline:
+        wm_check = subprocess.run(
+            ["xdotool", "set_desktop", "0"],
+            env={**os.environ, "DISPLAY": display},
+            capture_output=True,
+            check=False,
+        )
+        if wm_check.returncode == 0:
+            break
+        if wm_proc.poll() is not None:
+            # fluxbox exited prematurely — skip rather than fail
+            proc.kill()
+            pytest.skip(
+                f"fluxbox exited with {wm_proc.returncode} before tests could run"
+            )
+        time.sleep(0.1)
+    # Allow timeout as long as fluxbox stayed alive; xterm mapping will verify activation.
 
     yield display
 
