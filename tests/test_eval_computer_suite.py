@@ -62,6 +62,19 @@ def test_expect_second_page_reached_accepts_navigation_file():
     assert computer_suite._expect_second_page_reached(ctx)
 
 
+def test_session_persistence_eval_requires_state_file_written():
+    spec = next(
+        test
+        for test in computer_suite.tests
+        if test["name"] == "computer-use-web-session-persistence"
+    )
+
+    assert (
+        spec["expect"]["state.json written"]
+        is computer_suite._expect_state_file_written
+    )
+
+
 def test_expect_form_submitted_requires_echoed_field():
     ctx = ResultContext(
         files={"result.txt": "Error: form unavailable"},
@@ -814,3 +827,39 @@ def test_expect_current_url_captured_accepts_url():
         exit_code=0,
     )
     assert computer_suite._expect_current_url_captured(ctx)
+
+
+def test_check_used_save_browser_state_accepts(monkeypatch):
+    monkeypatch.setattr(
+        computer_suite,
+        "_executed_tool_calls",
+        lambda messages: ["save_browser_state('state.json')"],
+    )
+    assert computer_suite.check_used_save_browser_state([])
+
+
+def test_check_used_save_browser_state_rejects_open_page(monkeypatch):
+    monkeypatch.setattr(
+        computer_suite,
+        "_executed_tool_calls",
+        lambda messages: ["open_page('https://x.com')"],
+    )
+    assert not computer_suite.check_used_save_browser_state([])
+
+
+def test_check_used_load_browser_state_accepts(monkeypatch):
+    monkeypatch.setattr(
+        computer_suite,
+        "_executed_tool_calls",
+        lambda messages: ["load_browser_state('state.json')"],
+    )
+    assert computer_suite.check_used_load_browser_state([])
+
+
+def test_check_used_load_browser_state_rejects_save(monkeypatch):
+    monkeypatch.setattr(
+        computer_suite,
+        "_executed_tool_calls",
+        lambda messages: ["save_browser_state('state.json')"],
+    )
+    assert not computer_suite.check_used_load_browser_state([])

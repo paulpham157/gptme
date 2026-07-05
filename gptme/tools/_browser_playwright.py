@@ -27,6 +27,7 @@ from ._browser_thread import (
     BrowserThread,
     _is_connection_error,
     get_context_options,
+    set_storage_state_override,
 )
 from ._computer_gate import sensitive_action_gate
 
@@ -673,6 +674,7 @@ def save_browser_state(path: str) -> str:
 
         # 3. Future sessions load it automatically:
         #    export GPTME_BROWSER_STORAGE_STATE=~/.config/gptme/twitter-session.json
+        # OR call load_browser_state() programmatically without a restart.
 
     Args:
         path: File path to write the session JSON. Parent directories are
@@ -683,6 +685,84 @@ def save_browser_state(path: str) -> str:
     """
     logger.info("Saving browser session state to %s", path)
     return _execute_with_retry(_do_save_browser_state, path)
+
+
+def _do_load_browser_state(browser: Browser, path: str) -> str:
+    """Load a previously saved browser session state for use in the next open_page()."""
+    resolved = Path(path).expanduser()
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"Browser state file not found: {resolved}\n"
+            "Save a session first with save_browser_state(path), then reload."
+        )
+
+    # Close the current page + context so the next open_page() creates a fresh
+    # context that will pick up the loaded storage state.
+    _close_current_page()
+
+    # Register the override so get_context_options() uses it on the next context.
+    set_storage_state_override(resolved)
+
+    if _is_cdp_connection() and _browser is not None:
+        if _browser._session_context is not None:
+            try:
+                _browser._session_context.close()
+            except Exception:
+                pass
+            _browser._session_context = None
+
+        # CDP mode reuses a session context for future tabs; refresh it now so
+        # the next open_page() does not keep using the pre-load cookies.
+        _browser._session_context = browser.new_context(**get_context_options())
+        return (
+            f"Browser state loaded from {resolved}; CDP session context refreshed. "
+            "Call open_page(url) to start a session with the restored cookies and localStorage."
+        )
+
+    return (
+        f"Browser state loaded from {resolved}. "
+        "Call open_page(url) to start a session with the restored cookies and localStorage."
+    )
+
+
+def load_browser_state(path: str) -> str:
+    """Load a previously saved browser session (cookies, localStorage) from a file.
+
+    This is the in-session complement to ``save_browser_state()``.  Instead of
+    restarting gptme with ``GPTME_BROWSER_STORAGE_STATE``, call this function
+    directly to restore authentication state without a process restart.
+
+    After calling ``load_browser_state()``, call ``open_page(url)`` to start a
+    new browser session with the restored cookies and localStorage.
+
+    Typical workflow::
+
+        # Session A — log in and save state:
+        open_page("https://x.com/login")
+        fill_element("#username", "you@example.com")
+        fill_element("#password", "hunter2")
+        click_element("text=Log in")
+        save_browser_state("~/.config/gptme/twitter-session.json")
+
+        # Session B (same process, or a new one) — restore state and tweet:
+        load_browser_state("~/.config/gptme/twitter-session.json")
+        open_page("https://x.com")           # opens already logged in
+        click_element("text=What is happening?!")
+        fill_element('[data-testid="tweetTextarea_0"]', "hello from gptme!")
+        click_element('[data-testid="tweetButtonInline"]')
+
+    Args:
+        path: Path to the session JSON previously written by ``save_browser_state()``.
+              ``~`` is expanded to the home directory.
+
+    Returns:
+        Confirmation string. The next ``open_page()`` will use the restored state.
+
+    Raises:
+        FileNotFoundError: If *path* does not exist.
+    """
+    logger.info("Loading browser session state from %s", path)
+    return _execute_with_retry(_do_load_browser_state, path)
 
 
 def open_page(url: str) -> str:
