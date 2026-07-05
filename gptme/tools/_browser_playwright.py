@@ -829,10 +829,12 @@ def _select_option(browser: Browser, selector: str, value: str) -> str:
     if _current_page is None:
         raise RuntimeError("No page is open. Call open_page(url) first.")
     locator = _current_page.locator(selector)
-    try:
-        locator.select_option(value=value, timeout=10000)
-    except PlaywrightTimeoutError:
-        locator.select_option(label=value, timeout=10000)
+    # The removed label= fallback was unreachable: PlaywrightTimeoutError is
+    # raised when the locator cannot resolve (element absent), in which case
+    # label= on the same locator would also time out.  A no-option-match
+    # raises a different error that the except clause never caught.
+    # Drop the dead fallback to surface failures in 10 s instead of 20 s.
+    locator.select_option(value=value, timeout=10000)
     return _page_snapshot()
 
 
@@ -840,12 +842,12 @@ def select_option(selector: str, value: str) -> str:
     """Select an option from a <select> dropdown on the current page.
 
     Finds the ``<select>`` element and selects the option matching ``value``
-    by its ``value`` attribute or visible text.
+    by its ``value`` attribute.
 
     Args:
         selector: Playwright selector for the ``<select>`` element
                   (e.g. ``"select#country"``, ``"[name='size']"``).
-        value: The option value (``value`` attribute) or label text to select.
+        value: The option value (``value`` attribute) to select.
 
     Returns:
         Updated ARIA snapshot of the page after the selection.
