@@ -10,6 +10,7 @@ Validates end-to-end computer-use workflows:
 - Dynamic content: wait_for_element for elements that appear after user actions
 - Hover interaction: hover_element() for revealing hover-only menus/tooltips
 - Page state inspection: snapshot_page() after interactions, get_current_url() after navigation
+- "Can it Tweet?" end-to-end: full compose→post pipeline using a Twitter-like local fixture
 
 These tests run without a physical display because they use Playwright's
 headless mode via the browser tool. Desktop/screenshot tests that require
@@ -17,6 +18,7 @@ an X11 display are not included here — they belong in manual or CI-with-displa
 pipelines.
 """
 
+import base64
 import logging
 import urllib.parse
 from typing import TYPE_CHECKING
@@ -85,6 +87,42 @@ _CURRENT_URL_FIXTURE_HTML = (
 _CURRENT_URL_FIXTURE_URL = "data:text/html," + urllib.parse.quote(
     _CURRENT_URL_FIXTURE_HTML
 )
+
+# "Can it Tweet?" fixture (issue #216 milestone).
+#
+# A self-contained Twitter/X-like compose box that validates the full
+# "compose → post" pipeline without requiring a real Twitter account.
+#
+# The marker text "tweet-posted" only appears in the DOM after a real
+# click_element() call fires the submit handler, so read_page_text() cannot
+# return it from the initial page state.
+#
+# The contenteditable compose box uses Twitter's real data-testid so the same
+# selectors and editable-element path work against both this fixture and a real
+# X.com compose page.
+_TWEET_COMPOSE_FIXTURE_HTML = (
+    "<!doctype html><html><body>"
+    "<h1>Compose</h1>"
+    '<div role="group" aria-label="Tweet compose">'
+    '<div data-testid="tweetTextarea_0" role="textbox" contenteditable="true" '
+    'aria-label="Tweet text" style="width:100%;min-height:80px"></div>'
+    '<button data-testid="tweetButtonInline" data-role="tweet-button" '
+    'style="margin-top:8px">Tweet</button>'
+    "</div>"
+    '<div id="status"></div>'
+    "<script>"
+    "document.querySelector('[data-role=\"tweet-button\"]')"
+    ".addEventListener('click', function() {"
+    "var compose = document.querySelector('[data-testid=\"tweetTextarea_0\"]');"
+    "var text = (compose.innerText || compose.textContent || '').trim();"
+    "document.getElementById('status').textContent = 'tweet-posted:' + text;"
+    "});"
+    "</script>"
+    "</body></html>"
+)
+_TWEET_COMPOSE_FIXTURE_URL = "data:text/html;base64," + base64.b64encode(
+    _TWEET_COMPOSE_FIXTURE_HTML.encode()
+).decode("ascii")
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +373,32 @@ def _expect_url_after_reload_recorded(ctx) -> bool:
         content = content.decode(errors="replace")
     # The agent should record the fixture URL or at least a non-empty URL
     return len(content.strip()) > 5
+
+
+def _expect_tweet_posted(ctx) -> bool:
+    """The "Can it Tweet?" milestone check.
+
+    The fixture's JS click handler writes "tweet-posted:<text>" into #status
+    only after a real click_element() call. It is not rendered in the initial
+    page text, so this cannot pass on narration or unfired tool calls.
+    """
+    content = ctx.files.get("tweet.txt", ctx.stdout)
+    if isinstance(content, bytes):
+        content = content.decode(errors="replace")
+    return "tweet-posted" in content
+
+
+def _expect_tweet_text_echoed(ctx) -> bool:
+    """The composed tweet text must appear in the output (proving the fill worked)."""
+    content = ctx.files.get("tweet.txt", ctx.stdout)
+    if isinstance(content, bytes):
+        content = content.decode(errors="replace")
+    return "Hello from gptme" in content
+
+
+def check_used_tweet_textarea(messages: list[Message]) -> bool:
+    """Agent must address the tweet textarea by its Twitter data-testid selector."""
+    return any("tweetTextarea_0" in code for code in _executed_tool_calls(messages))
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +708,47 @@ tests: list["EvalSpec"] = [
             "used save_browser_state": check_used_save_browser_state,
             "used load_browser_state": check_used_load_browser_state,
             "used open_page for navigation": check_used_open_page,
+        },
+    },
+    # --- "Can it Tweet?" milestone (issue #216) ---
+    #
+    # End-to-end validation of the full compose→post pipeline using a
+    # self-contained fixture that mirrors Twitter's real DOM selectors
+    # (data-testid="tweetTextarea_0", data-testid="tweetButtonInline").
+    #
+    # This test proves the structured-first pipeline works for the milestone
+    # scenario without requiring a real Twitter account or session.  The
+    # same four tool calls (open_page, wait_for_element, fill_element,
+    # click_element) work against real Twitter once the user is authenticated
+    # via save_browser_state / GPTME_BROWSER_STORAGE_STATE.
+    {
+        "name": "computer-use-web-tweet-compose",
+        "files": {},
+        "run": "cat tweet.txt",
+        "prompt": (
+            "You are in computer-use mode. Simulate the 'Can it Tweet?' workflow:\n"
+            f"1. Call open_page('{_TWEET_COMPOSE_FIXTURE_URL}') to open a Twitter-like compose box.\n"
+            "2. Call wait_for_element('[data-testid=\"tweetTextarea_0\"]') to wait for the compose box to be ready.\n"
+            "3. Call fill_element('[data-testid=\"tweetTextarea_0\"]', 'Hello from gptme!') to type the tweet.\n"
+            "4. Call click_element('[data-testid=\"tweetButtonInline\"]') to click the Tweet button.\n"
+            "5. Call read_page_text() to read the page after posting.\n"
+            "6. Write the exact text returned by read_page_text() to tweet.txt."
+        ),
+        "tools": ["browser", "computer", "vision", "ipython", "save"],
+        "expect": {
+            "tweet.txt written": lambda ctx: (
+                "tweet.txt" in ctx.files or len(ctx.stdout.strip()) > 5
+            ),
+            "tweet-posted marker present": _expect_tweet_posted,
+            "tweet text echoed in response": _expect_tweet_text_echoed,
+            "clean exit": _expect_clean_exit,
+        },
+        "check_log": {
+            "used open_page for navigation": check_used_open_page,
+            "used wait_for_element before interaction": check_used_wait_for_element,
+            "used fill_element for tweet text": check_used_fill_element,
+            "used click_element for Tweet button": check_used_click_element,
+            "addressed compose box by Twitter data-testid": check_used_tweet_textarea,
         },
     },
 ]
