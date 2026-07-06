@@ -5,12 +5,14 @@ Provides functions to inspect gptme's installation state, configuration,
 and runtime environment. Used by both `--version` and `gptme-doctor`.
 """
 
+import importlib
 import importlib.metadata
 import importlib.util
 import json
 import platform
 import re
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -57,11 +59,83 @@ _INTERNAL_EXTRAS = {"all", "eval", "pyinstaller"}
 _EXTRAS_CACHE: list[ExtraInfo] | None = None
 
 
+def _load_toml_data(pyproject_path: Path) -> dict:
+    """Load TOML data using whichever parser is available."""
+    toml_module = None
+    for module_name in ("tomllib", "tomli", "tomlkit"):
+        try:
+            toml_module = importlib.import_module(module_name)
+            break
+        except ImportError:
+            continue
+
+    if toml_module is None:
+        return {}
+
+    try:
+        with pyproject_path.open("rb") as f:
+            data = toml_module.load(f)
+    except Exception:
+        return {}
+
+    return dict(data) if isinstance(data, Mapping) else {}
+
+
+def _requirement_package_name(requirement: str) -> str | None:
+    """Extract the distribution name from a dependency specifier."""
+    match = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _parse_extras_from_pyproject(pyproject_path: Path) -> list[ExtraInfo]:
+    """Parse extras from pyproject.toml as a fallback for editable installs.
+
+    Poetry editable installs don't populate Provides-Extra in package metadata.
+    This fallback reads pyproject.toml directly when that happens.
+    """
+    data = _load_toml_data(pyproject_path)
+    if not data:
+        return []
+
+    extras_dict: dict[str, list[str]] = data.get("tool", {}).get("poetry", {}).get(
+        "extras", {}
+    ) or data.get("project", {}).get("optional-dependencies", {})
+    if not extras_dict:
+        return []
+
+    result = []
+    for name, packages in sorted(extras_dict.items()):
+        if name in _INTERNAL_EXTRAS:
+            continue
+        normalized_packages = []
+        for package in packages:
+            if not isinstance(package, str):
+                continue
+            package_name = _requirement_package_name(package)
+            if package_name and package_name not in normalized_packages:
+                normalized_packages.append(package_name)
+        result.append(
+            ExtraInfo(
+                name=name,
+                installed=False,
+                description=_EXTRA_DESCRIPTIONS.get(
+                    name, name.replace("_", " ").title()
+                ),
+                packages=normalized_packages,
+            )
+        )
+    return result
+
+
 def _parse_extras_from_metadata() -> list[ExtraInfo]:
     """Parse extras from package metadata.
 
     Dynamically reads extras and their dependencies from the installed
     gptme package metadata, ensuring the list stays in sync with pyproject.toml.
+    Falls back to reading pyproject.toml directly when the editable install
+    (e.g. Poetry or uv) does not populate Provides-Extra in the metadata.
     """
     try:
         dist = importlib.metadata.distribution("gptme")
@@ -71,6 +145,25 @@ def _parse_extras_from_metadata() -> list[ExtraInfo]:
     # Get list of extras from package metadata
     all_extras = dist.metadata.get_all("Provides-Extra") or []
     extras = [e for e in all_extras if e not in _INTERNAL_EXTRAS]
+
+    # Fallback: Poetry and uv editable installs often omit Provides-Extra.
+    # Read pyproject.toml from the install source directory instead.
+    if not extras:
+        try:
+            direct_url = dist.read_text("direct_url.json")
+            if direct_url:
+                url_data = json.loads(direct_url)
+                dir_info = url_data.get("dir_info", {})
+                if dir_info.get("editable"):
+                    src_url = url_data.get("url", "")
+                    if src_url.startswith("file://"):
+                        src_dir = Path(src_url[7:])
+                        pyproject = src_dir / "pyproject.toml"
+                        if pyproject.exists():
+                            return _parse_extras_from_pyproject(pyproject)
+        except Exception:
+            pass
+        return []
 
     # Parse dependencies for each extra from Requires-Dist
     requires = dist.requires or []
