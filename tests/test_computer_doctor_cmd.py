@@ -143,9 +143,7 @@ class TestDoctorLinux:
                 return_value=_fake_transport(tmp_path),
             ),
             patch("gptme.tools.computer_transport.NativeComputerTransport", MagicMock),
-            patch.dict(
-                sys.modules, {"playwright.sync_api": pw_stub, "pyatspi": MagicMock()}
-            ),
+            patch.dict(sys.modules, {"playwright.sync_api": pw_stub, "pyatspi": None}),
         ):
             result = runner.invoke(doctor_cmd, [])
 
@@ -237,9 +235,7 @@ class TestDoctorLinux:
                 "gptme.tools.computer_transport.NativeComputerTransport",
                 return_value=transport,
             ),
-            patch.dict(
-                sys.modules, {"playwright.sync_api": pw_stub, "pyatspi": MagicMock()}
-            ),
+            patch.dict(sys.modules, {"playwright.sync_api": pw_stub, "pyatspi": None}),
         ):
             result = runner.invoke(doctor_cmd, ["--display", ":99"])
 
@@ -396,10 +392,16 @@ class TestDoctorMacOS:
 class TestDoctorPlaywright:
     """Doctor reports Playwright status correctly."""
 
-    def test_reports_playwright_not_installed(self, monkeypatch):
-        """When playwright cannot be imported, doctor reports it as a failure."""
+    def test_reports_playwright_not_installed(self, monkeypatch, tmp_path):
+        """When playwright cannot be imported, doctor warns but exits 0.
+
+        Native desktop control (xdotool/scrot) works without playwright.
+        Playwright is only needed for the browser tool, so its absence is a
+        warning (like pyatspi), not a hard failure.
+        """
         monkeypatch.setenv("DISPLAY", ":1")
         runner = CliRunner()
+        transport_mock = _fake_transport(tmp_path)
         with (
             patch("platform.system", return_value="Linux"),
             patch("platform.machine", return_value="x86_64"),
@@ -407,12 +409,28 @@ class TestDoctorPlaywright:
                 "gptme.cli.cmd_computer.shutil.which",
                 side_effect=lambda cmd: f"/usr/bin/{cmd}",
             ),
-            patch("gptme.tools.computer_transport.get_transport", return_value=None),
-            patch("gptme.tools.computer_transport.NativeComputerTransport", MagicMock),
-            patch.dict(sys.modules, {"playwright": None, "playwright.sync_api": None}),
+            patch(
+                "gptme.tools.computer_transport.get_transport",
+                return_value=transport_mock,
+            ),
+            patch(
+                "gptme.tools.computer_transport.NativeComputerTransport",
+                return_value=transport_mock,
+            ),
+            patch.dict(
+                sys.modules,
+                {
+                    "playwright": None,
+                    "playwright.sync_api": None,
+                },
+            ),
         ):
             result = runner.invoke(doctor_cmd, [])
         assert "playwright" in result.output.lower()
+        # playwright missing is a warning, not a hard failure — native computer use still works
+        assert result.exit_code == 0, (
+            f"Expected exit 0 (warning), got {result.exit_code}:\n{result.output}"
+        )
 
     def test_reports_chromium_binary_missing(self, monkeypatch, tmp_path):
         """When playwright is installed but chromium binary is missing, doctor reports it."""
@@ -511,9 +529,7 @@ class TestDoctorLatencySection:
                 side_effect=RuntimeError("transport boom"),
             ),
             patch("gptme.tools.computer_transport.NativeComputerTransport", MagicMock),
-            patch.dict(
-                sys.modules, {"playwright.sync_api": pw_stub, "pyatspi": MagicMock()}
-            ),
+            patch.dict(sys.modules, {"playwright.sync_api": pw_stub, "pyatspi": None}),
         ):
             result = runner.invoke(doctor_cmd, [])
 
