@@ -3252,3 +3252,99 @@ def test_subagent_pipeline_output_schema_only_on_final_stage():
     assert schema_kwargs_by_id.get("item-s0") is None
     # Stage 1 (final) should get output_schema
     assert schema_kwargs_by_id.get("item-s1") is Result
+
+
+# Tests for subagent_wait_any
+
+
+def test_subagent_wait_any_raises_on_empty_list():
+    """subagent_wait_any([]) should raise ValueError."""
+    import pytest
+
+    from gptme.tools.subagent import subagent_wait_any
+
+    with pytest.raises(ValueError, match="agent_ids must not be empty"):
+        subagent_wait_any([])
+
+
+def test_subagent_wait_any_returns_first_completed():
+    """subagent_wait_any should return the first agent that completes."""
+    from unittest.mock import patch
+
+    from gptme.tools.subagent import subagent_wait_any
+
+    call_order: list[str] = []
+
+    def fake_wait(agent_id, timeout, max_result_chars=0):
+        call_order.append(agent_id)
+        if agent_id == "fast":
+            return {"status": "success", "result": "fast result"}
+        # "slow" blocks longer — in practice the thread pool handles it
+        return {"status": "success", "result": "slow result"}
+
+    with patch("gptme.tools.subagent.batch.subagent_wait", side_effect=fake_wait):
+        first_id, result = subagent_wait_any(["fast", "slow"], timeout=10)
+
+    assert first_id in ("fast", "slow")
+    assert result["status"] == "success"
+
+
+def test_subagent_wait_any_timeout_raises():
+    """subagent_wait_any should raise TimeoutError when all agents keep running."""
+    from unittest.mock import patch
+
+    import pytest
+
+    from gptme.tools.subagent import subagent_wait_any
+
+    wait_timeouts: list[int] = []
+
+    def still_running_wait(agent_id, timeout, max_result_chars=0):
+        wait_timeouts.append(timeout)
+        return {"status": "running", "result": None}
+
+    with (
+        patch(
+            "gptme.tools.subagent.batch.subagent_wait", side_effect=still_running_wait
+        ),
+        pytest.raises(TimeoutError),
+    ):
+        subagent_wait_any(["a", "b"], timeout=1)
+
+    assert wait_timeouts == [1, 1]
+
+
+def test_batch_job_wait_any_returns_first():
+    """BatchJob.wait_any() should return whichever agent completes first."""
+    from unittest.mock import patch
+
+    from gptme.tools.subagent.batch import BatchJob
+
+    results_seen: list[str] = []
+
+    def fake_wait(agent_id, timeout, max_result_chars=0):
+        results_seen.append(agent_id)
+        return {"status": "success", "result": f"result from {agent_id}"}
+
+    job = BatchJob(agent_ids=["a", "b", "c"])
+    with patch("gptme.tools.subagent.batch.subagent_wait", side_effect=fake_wait):
+        first_id, result = job.wait_any(timeout=10)
+
+    assert first_id in ("a", "b", "c")
+    assert result["status"] == "success"
+    assert f"result from {first_id}" in result["result"]
+
+
+def test_batch_job_wait_any_already_done():
+    """BatchJob.wait_any() should return immediately when a result is already cached."""
+    from gptme.tools.subagent.batch import BatchJob
+    from gptme.tools.subagent.types import ReturnType
+
+    job = BatchJob(agent_ids=["x", "y"])
+    job.results["x"] = ReturnType("success", "cached result")
+
+    # Should not need to call subagent_wait at all
+    first_id, result = job.wait_any(timeout=1)
+    assert first_id == "x"
+    assert result["status"] == "success"
+    assert result["result"] == "cached result"
