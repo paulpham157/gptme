@@ -1450,6 +1450,39 @@ def doctor_cmd(display: str | None):
                 warn=True,
                 hint="pip install pyatspi  (optional — needed for accessibility_tree action)",
             )
+
+        # ~/.Xdefaults / ~/.Xresources bitmap-font check (terminal startup delay fix — #216).
+        # xterm's default Xft renderer scans all system font dirs on first launch
+        # (fontconfig scan), adding 1–3 s of startup latency.  Setting XTerm*font
+        # to a built-in bitmap font ("fixed") bypasses Xft entirely.
+        # Many modern distros apply X resources via ~/.Xresources (loaded by the
+        # display manager / xrdb), so we probe both files.
+        _xhome = Path.home()
+        _xres_content = ""
+        for _fname in (".Xresources", ".Xdefaults"):
+            _xp = _xhome / _fname
+            if _xp.exists():
+                _xres_content += (
+                    _xp.read_text(encoding="utf-8", errors="replace") + "\n"
+                )
+        _has_bitmap_font = bool(
+            re.search(
+                r"(?m)^XTerm\*(?:bold)?[Ff]ont\s*:\s*(?:fixed|6x13|7x13|8x13|9x15)",
+                _xres_content,
+            )
+        )
+        _check(
+            "~/.Xresources / ~/.Xdefaults uses bitmap font (fast xterm startup)"
+            if _has_bitmap_font
+            else "~/.Xresources / ~/.Xdefaults missing bitmap font (xterm startup may be slow — 1–3 s)",
+            ok=True,
+            warn=not _has_bitmap_font,
+            hint=(
+                "Add  XTerm*font: fixed  to ~/.Xdefaults and run  xrdb -merge ~/.Xdefaults\n"
+                "       This cuts xterm startup from ~2 s to < 100 ms (issue #216).\n"
+                "       See: gptme-util computer latency --terminal"
+            ),
+        )
         click.echo()
 
     # --- macOS native tools ---
